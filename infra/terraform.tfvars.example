@@ -1,0 +1,10 @@
+aws_region   = "us-east-1"
+github_owner = "loriamichaelj"
+
+consumer_repos = [
+  "aws-cicd-demo-python-app",
+  "aws-cicd-demo-node-app",
+]
+
+create_oidc_provider       = true
+existing_oidc_provider_arn = ""
