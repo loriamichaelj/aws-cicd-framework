@@ -1,0 +1,15 @@
+failure-threshold: style
+
+trustedRegistries:
+  - docker.io
+  - "*.dkr.ecr.*.amazonaws.com"
+
+override:
+  error:
+    - DL3002
+    - DL3007
+    - DL3008
+    - DL3013
+    - DL3016
+    - DL3028
+    - DL3042
