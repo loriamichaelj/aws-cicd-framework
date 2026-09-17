@@ -49,9 +49,9 @@ variable "existing_oidc_provider_arn" {
 }
 
 variable "role_name_prefix" {
-  description = "Prefix for the per-environment deploy role names. 'gha-deploy' yields gha-deploy-dev."
+  description = "Prefix for the per-environment deploy role names. 'loria-gha-deploy' yields loria-gha-deploy-dev."
   type        = string
-  default     = "gha-deploy"
+  default     = "loria-gha-deploy"
 }
 
 variable "max_session_duration" {

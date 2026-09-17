@@ -258,7 +258,7 @@ called out in REQUIREMENTS.md §7 — no schema migration needed when that phase
 
 ### 6.1 Roles
 
-Three roles, one per environment: `gha-deploy-dev`, `gha-deploy-stage`, `gha-deploy-prod`.
+Three roles, one per environment: `loria-gha-deploy-dev`, `loria-gha-deploy-stage`, `loria-gha-deploy-prod`.
 
 ### 6.2 Trust policy (per role — example for `prod`)
 
@@ -285,7 +285,7 @@ Three roles, one per environment: `gha-deploy-dev`, `gha-deploy-stage`, `gha-dep
 
 Repeat for the second consumer (`aws-cicd-demo-node-app`) — multiple `sub` values via a
 condition list on the same shared per-environment role, rather than 2×3 roles. Both demo
-repos assume the same `gha-deploy-prod` role; the trust policy's `StringEquals` condition
+repos assume the same `loria-gha-deploy-prod` role; the trust policy's `StringEquals` condition
 becomes a list of both repos' `sub` values for that environment.
 
 The `:environment:prod` segment is the load-bearing part — it ties role assumption to the
