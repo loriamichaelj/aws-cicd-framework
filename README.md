@@ -32,14 +32,19 @@ give the build and containerization steps a real artifact to operate on.
 ## How it works
 
 ```
-push to dev  ──▶  build ──▶ hadolint ──▶ containerize ──▶ push to ECR
-                                              │
-                                              ▼
-                              render task definition ──▶ manifest to S3 ──▶ CloudWatch event
+push to dev  ──▶  build ──▶ hadolint ──▶ containerize ──▶ image saved to S3
+                                                                  │
+                                                                  ▼
+                                    render task definition ──▶ manifest to S3 ──▶ CloudWatch event
 
 dev ──[approval]──▶ stage ──[approval]──▶ prod
       artifact promoted by pointer; the image is never rebuilt
 ```
+
+**Note:** images are currently saved to S3 as `docker save` tarballs rather than pushed to
+ECR — the account's shared GitHub Actions role doesn't yet have ECR permissions. This is a
+deliberate interim substitution, not a design change: swapping the S3 upload step for an
+ECR push later is a contained change to one step.
 
 Three ideas carry most of the weight:
 
@@ -48,11 +53,11 @@ with its Git SHA. Promoting `dev` to `stage` copies the deployment manifest to t
 target environment's S3 prefix. The image digest referenced in `stage` and `prod` is
 provably identical to the one built on `dev`.
 
-**The approval gate is an AWS precondition, not a UI formality.** Each environment has
-one IAM role whose trust policy accepts only the OIDC subject
-`repo:<owner>/<repo>:environment:<env>`. GitHub mints that claim only once a job is
-genuinely executing under that Environment — that is, after its required reviewer has
-approved. An unapproved job cannot assume the role at all.
+**The approval gate is an AWS precondition, not a UI formality.** The shared deploy role's
+trust policy accepts only the OIDC subject `repo:<owner>/<repo>:environment:<env>`.
+GitHub mints that claim only once a job is genuinely executing under that Environment —
+that is, after its required reviewer has approved. An unapproved job cannot assume the
+role at all.
 
 **No long-lived AWS credentials exist anywhere.** Authentication is GitHub OIDC
 federation end to end. There are no access keys in any repository, secret store, or
@@ -108,5 +113,11 @@ at the latest compatible release. Consumers reference `@v1`.
 
 ## Status
 
-Under active construction on `dev`. Completed so far: GitHub OIDC federation and the
-per-environment IAM deploy roles (`infra/oidc-provider.tf`, `infra/iam-roles.tf`).
+Under active construction on `dev`. Authentication uses a pre-existing shared GitHub
+Actions OIDC role for this AWS account rather than roles provisioned by this repo — IAM
+role/provider creation is outside the current account permissions. The role's ARN is set
+as the `AWS_DEPLOY_ROLE_ARN` GitHub Environment variable in each consumer repo; its trust
+policy is managed directly in AWS, outside Terraform.
+
+Completed so far: `deploy.yml` (the reusable build/lint/containerize pipeline) and the
+thin caller workflows in both demo repos.

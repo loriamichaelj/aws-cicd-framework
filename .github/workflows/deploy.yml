@@ -1,0 +1,87 @@
+name: Deploy
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        type: string
+        required: true
+      language:
+        type: string
+        required: true
+      environment:
+        type: string
+        required: true
+      aws-region:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - if: inputs.language == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - if: inputs.language == 'python'
+        run: |
+          pip install -r requirements.txt
+          python -m compileall -q src
+
+      - if: inputs.language == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - if: inputs.language == 'node'
+        run: |
+          npm ci
+          npm run lint
+
+  lint-dockerfile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: loriamichaelj/aws-cicd-framework
+          ref: dev
+          path: .framework
+
+      - uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          config: .framework/.hadolint.yaml
+
+  deploy:
+    needs: [build, lint-dockerfile]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - run: |
+          docker build -t ${{ inputs.app-name }}:${{ github.sha }} .
+          docker save ${{ inputs.app-name }}:${{ github.sha }} | gzip > image.tar.gz
+          aws s3 cp image.tar.gz s3://${{ vars.S3_BUCKET }}/${{ inputs.app-name }}/${{ inputs.environment }}/${{ github.sha }}/image.tar.gz
+
+  notify:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "deployed ${{ inputs.app-name }} (${{ inputs.language }}) to ${{ inputs.environment }} at ${{ github.sha }}"
