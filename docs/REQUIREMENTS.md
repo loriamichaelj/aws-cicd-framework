@@ -24,8 +24,9 @@ follow-on phase.
   (`uses: <your-username>/aws-cicd-framework/...@<version>`), not by copy-paste.
 - Support **Python and Node.js** consumers via a single reusable workflow, parameterized
   by a `language` input.
-- Demonstrate **environment promotion** (dev → stage → prod) where the same built artifact is
-  promoted forward, never rebuilt per environment.
+- Demonstrate **environment promotion** (dev → stage → prod) as a branch-based SDLC:
+  `dev` auto-deploys on push; `stage`/`prod` deploy on PR merge into those branches, each
+  independently built and tested from that branch's own state at merge time.
 - Demonstrate **approval-gated releases** using native GitHub Environments.
 - Demonstrate **rollback** as a first-class, manually-triggered operation with a real audit
   trail.
@@ -103,17 +104,18 @@ follow-on phase.
 
 ### 4.4 Environment promotion
 
-- FR-11: The framework MUST support promoting an existing artifact from one environment to
-  the next (dev → stage → prod) **without rebuilding**. *Built as a direct S3-to-S3 copy
-  of the image tarball (see FR-5), not a manifest copy — manifest writing (FR-9) isn't
-  built yet. Same no-rebuild guarantee either way. See §8.*
-- FR-12: Promotion MUST be implemented as a distinct reusable workflow (`promote.yml`),
-  separate from the build/containerize pipeline. *Built.*
-- FR-13: Promotion to `stage` and `prod` MUST require GitHub Environment approval gates
-  (required reviewers). Promotion/deploy to `dev` MUST NOT require approval. *`promote.yml`
-  is built and gates correctly via `environment: ${{ inputs.target-environment }}`, but
-  the `stage`/`prod` GitHub Environments themselves don't exist yet, so this is untested
-  end-to-end.*
+- FR-11: The framework MUST support promoting code from one environment's branch to the
+  next (dev → stage → prod) via pull request. Each environment independently builds,
+  tests, containerizes, and deploys from its own branch at merge time — this is a
+  deliberate pivot from the original "never rebuild" model. *Amended — see §8.*
+- FR-12: ~~Promotion MUST be implemented as a distinct reusable workflow (`promote.yml`),
+  separate from the build/containerize pipeline.~~ **Retired.** With each environment
+  independently rebuilding from its own branch, there's no separate artifact-move step
+  left to implement — the existing `deploy.yml` caller's `pull_request` trigger *is* the
+  promotion mechanism. `promote.yml` has been deleted from all three repos. See §8.
+- FR-13: Deploys to `stage` and `prod` (triggered by PR merge into those branches) MUST
+  require GitHub Environment approval gates (required reviewers). Deploy to `dev` MUST NOT
+  require approval.
 
 ### 4.5 Rollback
 
@@ -126,8 +128,10 @@ follow-on phase.
 
 ### 4.6 Observability
 
-- FR-17: Every deploy, promote, and rollback event MUST emit a CloudWatch record (custom
-  metric and/or log entry) tagged with environment, application name, and event type.
+- FR-17: Every deploy and rollback event MUST emit a CloudWatch record (custom metric
+  and/or log entry) tagged with environment, application name, and event type. *"Promote"
+  is no longer a distinct event type — see §8; a deploy triggered by a `stage`/`prod`
+  PR-merge is still just a `deploy` event, distinguished by its `environment` tag.*
 - FR-18: CloudWatch log groups MUST be scoped per environment.
 
 ### 4.7 Identity and access
@@ -196,11 +200,11 @@ traffic, or need to run to be considered complete.
   containerize → save image to S3 (see FR-5) → render task definition → write manifest to
   S3 → CloudWatch event, with no manual approval required. *The render-task-definition,
   write-manifest, and CloudWatch steps are not yet built — see §8.*
-- A manually dispatched promotion from `dev` to `stage`, and from `stage` to `prod`, succeeds only
-  after the corresponding GitHub Environment's required reviewer approves, and results in the
-  **exact same object** existing at the target environment's S3 key (provable by comparing
-  ETags/checksums across environment prefixes — digest-in-a-manifest once FR-9 is built).
-  Untested end-to-end today since `stage`/`prod` Environments don't exist yet — see §8.
+- A pull request merged into `stage` (or `prod`) triggers the `detect-environment` job to
+  resolve the correct environment name from `github.event.pull_request.base.ref`, then
+  runs the full build → test → containerize → S3-upload pipeline for that environment,
+  succeeding only after the corresponding GitHub Environment's required reviewer approves.
+  A pull request that's closed *without* merging MUST NOT trigger a deploy.
 - A manually dispatched rollback on any environment restores a prior manifest and is
   recorded as a distinct, auditable event.
 - Attempting to assume the `prod` OIDC role from a workflow run not executing under the
@@ -257,12 +261,17 @@ none change the manifest schema or the eventual ECS seam described in §7.
   manual creation in the console was the pragmatic call. `infra/s3.tf` stays as the
   reference spec for the bucket's intended configuration (versioning, encryption,
   public-access-block) — see DESIGN.md §10.
-- **`promote.yml` copies the image tarball directly, not a manifest (FR-11).** The
-  original design copied a `manifest.json` pointer between environment prefixes; since
-  manifest writing (FR-9) isn't built, `promote.yml` copies
-  `<app-name>/<source-environment>/<git-sha>/image.tar.gz` directly instead. Same
-  no-rebuild guarantee, same server-side S3 copy — just moving the artifact that actually
-  exists today instead of a pointer to it. Revisit once FR-9 is built.
+- **Promotion model pivoted from artifact-copy to branch-rebuild (FR-11, FR-12).**
+  `promote.yml` (and its S3-to-S3 image-copy mechanism, briefly built and verified
+  working dev→stage) has been deleted from all three repos. In its place: `stage`/`prod`
+  are now real branches, and each demo repo's `deploy.yml` caller triggers on
+  `pull_request: closed` into `stage`/`prod` (in addition to `push` on `dev`), with a
+  `detect-environment` job resolving the target environment from the trigger context —
+  same shape as a standard branch-per-environment SDLC. This was a deliberate choice to
+  match a specific reference pattern, made with full awareness that it trades away the
+  "same artifact, never rebuilt" guarantee FR-11 originally specified and that
+  `promote.yml` had already proven working. Both models are legitimate; this project now
+  uses the rebuild-per-branch one.
 
 None of this changes what's still deferred per §7 — ECS, `rollback.yml`, CloudWatch
 recording, and manifest/task-definition rendering remain unbuilt, independent of these

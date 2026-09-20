@@ -33,14 +33,15 @@ give the build and containerization steps a real artifact to operate on.
 ## How it works
 
 ```
-push to dev  ──▶  build ──▶ hadolint ──▶ containerize ──▶ image saved to S3
-                                                                  │
-                                                                  ▼
-                                    render task definition ──▶ manifest to S3 ──▶ CloudWatch event
-
-dev ──[approval]──▶ stage ──[approval]──▶ prod
-      artifact promoted by pointer; the image is never rebuilt
+push to dev            ──▶  build ──▶ hadolint ──▶ containerize ──▶ image saved to S3
+PR merged into stage    ──▶  (same pipeline, gated by stage's required reviewer)
+PR merged into prod     ──▶  (same pipeline, gated by prod's required reviewer)
 ```
+
+Each environment independently builds, tests, and containerizes from its own branch at
+the moment of trigger — `dev` on every push, `stage`/`prod` on PR merge. A
+`detect-environment` job in each caller resolves which environment name to pass based on
+the trigger context (branch name for push, PR base ref for merge).
 
 **Note:** images are currently saved to S3 as `docker save` tarballs rather than pushed to
 ECR — the account's shared GitHub Actions role doesn't yet have ECR permissions. This is a
@@ -49,11 +50,12 @@ ECR push later is a contained change to one step.
 
 Three ideas carry most of the weight:
 
-**Promotion moves a pointer, not a build.** An image is built exactly once and tagged
-with its Git SHA. Promoting `dev` to `stage` copies the saved image tarball directly to
-the target environment's S3 prefix (a server-side S3-to-S3 copy — no download, no
-rebuild). The object at `stage` and `prod` is provably the exact same bytes built on
-`dev`; this becomes a manifest-and-digest comparison once deployment manifests are built.
+**Every environment builds from its own branch, gated by review.** `dev`/`stage`/`prod`
+are real branches; merging into `stage` or `prod` is what triggers that environment's
+build. This project briefly used a different model — promoting a single built artifact
+forward via a `promote.yml` copy step, with no rebuild at all — and proved it working
+end-to-end before deliberately pivoting to this branch-based model to match a specific
+reference pattern. Both are legitimate; this is the one currently in use.
 
 **The approval gate is an AWS precondition, not a UI formality.** The shared deploy role's
 trust policy accepts only specific OIDC subjects — one per consumer repo's environment,
@@ -99,7 +101,7 @@ a reviewable diff is itself the least-privilege practice being demonstrated.
 
 | Branch | Contents |
 | --- | --- |
-| `devmain` | This README only. Entry point, signpost, and GitHub default branch. |
+| `main` | This README only. Entry point, signpost, and GitHub default branch. |
 | `dev` | Active development. |
 | `stage` | Promoted from `dev`. |
 | `prod` | Promoted from `stage`. **The complete framework lives here.** |
@@ -129,12 +131,19 @@ VPC networking setup wasn't worth the friction for a one-off bucket. `infra/s3.t
 as the reference spec for its configuration.
 
 Completed so far: `deploy.yml` (build/test/deploy/notify, both languages, real unit tests
-and hadolint in the `test` job) and `promote.yml` (S3-to-S3 image copy between
-environments, gated on the target environment's approval rule), plus the thin caller
-workflows for both in each demo repo. `AWS_DEPLOY_ROLE_ARN`/`S3_BUCKET` are set as `dev`
-Environment variables in both consumer repos; `stage`/`prod` Environments don't exist yet,
-so `promote.yml` is untested end-to-end.
+and hadolint in the `test` job), unchanged since the SDLC pivot below — only the callers
+changed. `AWS_DEPLOY_ROLE_ARN`/`S3_BUCKET` are set as `dev` Environment variables in both
+consumer repos, and as `stage` variables for `python-app`.
 
-`aws-cicd-demo-python-app`'s `dev` branch has been pushed, triggering the first real
-pipeline run. `aws-cicd-demo-node-app`'s `dev` branch is committed locally but not yet
-pushed — held back pending the python-app run's result.
+**SDLC model pivoted mid-build.** `promote.yml` (a `workflow_dispatch`-triggered,
+no-rebuild S3-copy promotion step) was built and verified working end-to-end — a real
+`dev`→`stage` promotion, gated by `stage`'s required reviewer, produced the exact same S3
+object at the new key. It has since been retired in favor of a branch-based SDLC:
+`stage`/`prod` are now real branches, and each demo repo's `deploy.yml` caller triggers on
+PR-merge into them (in addition to push on `dev`), independently rebuilding per
+environment. See `docs/REQUIREMENTS.md` §8 for the full reasoning.
+
+`aws-cicd-demo-python-app` has a real pipeline run confirmed working for both `dev` (push)
+and `stage` (PR merge) under the new model. `aws-cicd-demo-node-app` hasn't been validated
+under the new triggers yet — its `stage` branch/Environment/trust-policy entry status is
+unconfirmed. `prod` isn't set up for either repo yet.

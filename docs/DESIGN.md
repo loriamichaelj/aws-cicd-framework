@@ -16,8 +16,8 @@
 │  .github/workflows/                                                 │
 │    deploy.yml                  build/test/deploy/notify jobs,       │
 │                                 inlined steps (no composite actions  │
-│                                 yet — see §3)                        │
-│    promote.yml                 built — S3-to-S3 image copy          │
+│                                 yet — see §3). Environment-agnostic  │
+│                                 — the caller decides which env.      │
 │    rollback.yml                planned, not yet built                │
 │                                                                     │
 │  infra/ (Terraform)                                                 │
@@ -32,14 +32,18 @@
 ┌────────┴─────────┐   ┌─────┴────────────┐
 │ aws-cicd-demo-    │   │ aws-cicd-demo-   │
 │ python-app        │   │ node-app         │
-│ (thin caller)     │   │ (thin caller)    │
+│ dev/stage/prod     │   │ dev/stage/prod   │
+│ branches           │   │ branches          │
 └───────────────────┘   └──────────────────┘
 ```
 
-Each consumer repo's `.github/workflows/deploy.yml` is a **thin caller**: it checks out
-nothing itself and calls the framework's reusable workflow with its own inputs. The
-GitHub Environment declaration (for the approval gate) lives on the *called* workflow's
-own job, not on the caller — see §4 for why.
+Each consumer repo's `.github/workflows/deploy.yml` is a **thin caller** with a branch-
+based SDLC: `push` to `dev` triggers automatically; PR merges into `stage`/`prod` trigger
+those environments. A `detect-environment` job resolves which environment name to pass
+based on the trigger context, then a `deploy` job calls the framework's reusable workflow
+with that name. The GitHub Environment declaration (for the approval gate) lives on the
+*called* workflow's own job, not on the caller — see §4 for why. **Retired:**
+`promote.yml` — see §2.2's history and REQUIREMENTS.md §8 for why.
 
 **Naming note:** GitHub repository names carry the `aws-cicd-` prefix purely for grouping
 and discoverability on GitHub (profile listing, search, topics). AWS/manifest `app-name`
@@ -87,42 +91,27 @@ the framework README.
 Not yet built at all: `render-task-definition` and `write-manifest-s3` equivalents (FR-8,
 FR-9). Adding them is a new job between `deploy` and `notify`, not a redesign.
 
-### 2.2 `promote.yml` (built)
+`deploy.yml` itself is **environment-agnostic** — it has no idea whether it's being
+invoked for `dev`, `stage`, or `prod`; it just does what `inputs.environment` says. That's
+what let the SDLC pivot below happen without touching this file at all — only the callers
+changed.
 
-```yaml
-on:
-  workflow_call:
-    inputs:
-      app-name: { type: string, required: true }
-      source-environment: { type: string, required: true }
-      target-environment: { type: string, required: true }
-      git-sha: { type: string, required: true }
-      aws-region: { type: string, required: true }
-```
+### 2.2 `promote.yml` — built, tested working, then retired
 
-Jobs:
+For a window during the build, promotion was a separate `workflow_call` reusable workflow
+that did a single `aws s3 cp`, copying the image tarball from
+`<app-name>/<source-environment>/<git-sha>/image.tar.gz` to
+`<app-name>/<target-environment>/<git-sha>/image.tar.gz` — a server-side S3-to-S3 copy, no
+rebuild. This was built, and verified working end-to-end: a real dev→stage promotion run,
+gated by `stage`'s required reviewer, produced the exact same object at the new key.
 
-1. **`promote`** — a single `aws s3 cp` copying the image tarball from
-   `<app-name>/<source-environment>/<git-sha>/image.tar.gz` to
-   `<app-name>/<target-environment>/<git-sha>/image.tar.gz` — a server-side S3-to-S3 copy,
-   no download, no rebuild. **Amended from the original plan**: the original design copied
-   a `manifest.json` pointer rather than the image itself, but manifest writing (FR-9)
-   isn't built yet, so there's no manifest to copy. Copying the image tarball directly is
-   the real artifact that exists today and achieves the same guarantee (FR-11): the exact
-   same bytes, just at a new key. Revisit once `write-manifest-s3` exists — at that point
-   this job should copy the manifest (which references the image) instead, matching the
-   original design.
-2. **`notify`** — `if: always()`, echoes success or failure based on `needs.promote.result`.
-
-Both jobs live inside `promote.yml`, so **the `promote` job itself** declares
-`environment: ${{ inputs.target-environment }}` — that's where the GitHub Environment
-approval gate actually lives (see §4). The consumer's *calling* job (in
-`aws-cicd-demo-python-app` / `aws-cicd-demo-node-app`) must NOT declare `environment:` —
-GitHub Actions doesn't allow that key on a job that only has `uses:`. It's a
-`workflow_dispatch`-triggered thin caller with dropdown-constrained `source-environment`/
-`target-environment` inputs (prevents typos like promoting *from* prod) and a free-text
-`git-sha` — there's no way to look up "the latest dev build" automatically without the
-manifest system, so the person triggering promotion supplies it directly.
+It has since been **deleted from all three repos**, as a deliberate pivot (not a walk-back
+due to a problem — it worked) to a branch-based SDLC matching a specific reference
+pattern: `dev`/`stage`/`prod` as real branches, each independently rebuilding on its own
+trigger (push for `dev`, PR-merge for `stage`/`prod`). See REQUIREMENTS.md §8 for the full
+reasoning and the trade-off being made. If a future need calls for the no-rebuild
+guarantee again, the git history has a complete, working reference implementation to
+restore from — this wasn't removed because it was broken.
 
 ### 2.3 `rollback.yml` (planned, not yet built)
 
@@ -148,14 +137,10 @@ service exists to health-check in this phase). Jobs:
 
 The original plan factored each step into a named composite action under
 `.github/actions/` (table below, kept for reference). In the actual build, `deploy.yml`
-and `promote.yml` both inline every step directly rather than factoring out shared logic.
-
-Worth noting: with `promote.yml` now built, the `configure-aws-credentials` OIDC
-assume-role step is duplicated verbatim between `deploy.yml`'s `deploy` job and
-`promote.yml`'s `promote` job — exactly the kind of repetition that would justify a
-composite action. Not factored out yet since it's still only two occurrences and each is
-three lines; revisit once `rollback.yml` adds a third, or if the assume-role step grows
-more complex than it is today.
+inlines every step directly rather than factoring out shared logic — with `promote.yml`
+now retired (§2.2), `deploy.yml` is currently the only reusable workflow, so there's
+nothing to share a composite action between yet. Revisit once `rollback.yml` is built and
+its `configure-aws-credentials` step duplicates `deploy.yml`'s.
 
 Planned action names, if/when this gets factored out:
 
@@ -166,24 +151,23 @@ Planned action names, if/when this gets factored out:
 | `lint-dockerfile` | `dockerfile-path` | `passed` | Runs `hadolint` against the consumer's Dockerfile. Fails on any error-level finding. |
 | `docker-build-push` | `aws-region`, `docker-context`, `git-sha` | `image-location`, `image-digest` | Multi-stage build; currently uploads to S3 (see REQUIREMENTS.md §8), ECR once available. |
 | `render-task-definition` | `app-name`, `environment`, `image-location`, `container-port`, `cpu`, `memory`, `log-group` | `task-def-json-path` | **Pure templating — no AWS API calls.** Produces a syntactically valid ECS task-def JSON. `executionRoleArn` is a placeholder value, documented as required-before-registration. |
-| `write-manifest-s3` | `s3-bucket`, `app-name`, `environment`, `image-location`, `image-digest`, `task-def-json-path` | `manifest-s3-key` | Assembles manifest (see §5 schema) and uploads. Also updates the environment's "current" pointer and appends to rollback history. |
-| `promote-artifact` | `s3-bucket`, `app-name`, `source-environment`, `target-environment`, `git-sha` | `promoted-manifest-key` | Copy-only. No rebuild, no re-render. |
+| `write-manifest-s3` | `s3-bucket`, `app-name`, `environment`, `image-location`, `image-digest`, `task-def-json-path` | `manifest-s3-key` | Assembles manifest (see §5 schema) and uploads. Also appends to rollback history. |
+| ~~`promote-artifact`~~ | — | — | **Obsolete.** Belonged to the retired artifact-copy promotion model (§2.2); the branch-rebuild SDLC has no promotion step to factor out. |
 | `rollback-from-manifest` | `s3-bucket`, `app-name`, `environment`, `target-sha` (optional) | `restored-manifest-key` | Reads rollback history; re-points "current". |
 | `record-deployment-cloudwatch` | `environment`, `app-name`, `event-type`, `cloudwatch-log-group` | — | Emits a custom metric and/or structured log entry. |
 
 ## 4. GitHub Environments and approval gates
 
 Three GitHub Environments belong in **each consumer repo** (not in the framework repo):
-`dev`, `stage`, `prod`.
+`dev`, `stage`, `prod`. `stage`/`prod` are also now real **branches** in each repo (a
+deliberate pivot — see §2.2), receiving PR merges as their trigger.
 
 - `dev`: no required reviewers. Auto-triggered on push to the `dev` branch. Created and in
   use today.
-- `stage`: required reviewer(s) configured. The promotion job *inside* `promote.yml`
-  declares `environment: stage` (not the consumer's caller job — see below). `promote.yml`
-  itself is built; the `stage` Environment isn't created yet, so this path is untested.
+- `stage`: required reviewer(s) configured. Triggered by a PR merged into the `stage`
+  branch. Environment created and tested working for `python-app`.
 - `prod`: required reviewer(s) configured (recommend a distinct reviewer set from `stage`).
-  The promotion job declares `environment: prod`, same placement. Same status as `stage`
-  — code is built, the Environment isn't created yet.
+  Triggered by a PR merged into the `prod` branch. Not yet created.
 
 **Critical mechanic, corrected from the original spec:** GitHub Actions does not allow
 `environment:` on a job that only has `uses:` (calls a reusable workflow) — `actionlint`
@@ -195,32 +179,51 @@ declaration has to live on the reusable workflow's *own* job — the one that ac
 all), so the mechanism holds; it's just declared in a different file than you'd expect:
 
 ```yaml
-# In the consumer's caller workflow — no `environment:` here:
+# In the consumer's caller workflow (deploy.yml) — no `environment:` here,
+# just a detect-environment job resolving which name to pass:
 jobs:
-  promote-to-prod:
-    uses: <your-username>/aws-cicd-framework/.github/workflows/promote.yml@v1
+  detect-environment:
+    if: |
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
+    outputs:
+      environment: ${{ steps.detect.outputs.environment }}
+    steps:
+      - id: detect
+        run: |
+          if [[ "${GITHUB_REF_NAME}" == "dev" ]]; then
+            echo "environment=dev" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event.pull_request.base.ref }}" == "stage" ]]; then
+            echo "environment=stage" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event.pull_request.base.ref }}" == "prod" ]]; then
+            echo "environment=prod" >> "$GITHUB_OUTPUT"
+          fi
+
+  deploy:
+    needs: detect-environment
+    permissions:
+      id-token: write
+      contents: read
+    uses: loriamichaelj/aws-cicd-framework/.github/workflows/deploy.yml@dev
     with:
-      app-name: python-app
-      source-environment: stage
-      target-environment: prod
-      git-sha: ${{ inputs.git-sha }}
+      environment: ${{ needs.detect-environment.outputs.environment }}
+      ...
     secrets: inherit
 ```
 
 ```yaml
-# Inside promote.yml itself — the job that does the work declares it:
+# Inside deploy.yml itself — the job that does the work declares it:
 jobs:
-  promote:
+  deploy:
     runs-on: ubuntu-latest
-    environment: ${{ inputs.target-environment }}
+    environment: ${{ inputs.environment }}
     steps: ...
 ```
 
-`secrets: inherit` combined with the `promote` job's `environment:` is what allows
+`secrets: inherit` combined with the `deploy` job's `environment:` is what allows
 environment-scoped secrets (the shared role's ARN, per environment) to resolve correctly
-inside the reusable workflow's steps — same effect as originally intended, corrected
-placement. This is exactly what `deploy.yml`'s `deploy` job (§2.1) and `promote.yml`'s
-`promote` job (§2.2) already do; apply the same pattern to `rollback.yml` when it's built.
+inside the reusable workflow's steps. This is exactly what `deploy.yml`'s `deploy` job
+(§2.1) already does; apply the same pattern to `rollback.yml`'s caller when it's built.
 
 Because GitHub only mints the `environment:<env>` claim in the OIDC token when a job is
 actually executing under that Environment's approval gate, this is also the mechanism that
@@ -228,16 +231,16 @@ makes IAM trust-policy scoping (§6) meaningful — approval isn't just a UI gat
 precondition for the AWS role even being assumable.
 
 **A second, related gotcha caught in real testing:** permissions cascade downward through
-`uses:` calls and can only be narrowed, never widened. `deploy.yml`'s `deploy` job (and
-`promote.yml`'s `promote` job) each request `permissions: { id-token: write, contents: read }`
-at the job level — but that request is only honored if the *calling* job also grants it.
-The consumer repos' caller jobs originally declared no `permissions:` at all, which
-defaults to `id-token: none` and silently clamps the nested job down to that, regardless
-of what the reusable workflow itself asks for. GitHub surfaces this as a hard failure at
-dispatch time (`startup_failure`, zero jobs created), not a runtime permission error inside
-a job — e.g.: `Error calling workflow '.../deploy.yml@dev'. The nested job 'deploy' is
-requesting 'id-token: write', but is only allowed 'id-token: none'.` The fix: every caller
-job that invokes a reusable workflow needing OIDC must also declare
+`uses:` calls and can only be narrowed, never widened. `deploy.yml`'s `deploy` job requests
+`permissions: { id-token: write, contents: read }` at the job level — but that request is
+only honored if the *calling* job also grants it. The consumer repos' caller jobs
+originally declared no `permissions:` at all, which defaults to `id-token: none` and
+silently clamps the nested job down to that, regardless of what the reusable workflow
+itself asks for. GitHub surfaces this as a hard failure at dispatch time
+(`startup_failure`, zero jobs created), not a runtime permission error inside a job —
+e.g.: `Error calling workflow '.../deploy.yml@dev'. The nested job 'deploy' is requesting
+'id-token: write', but is only allowed 'id-token: none'.` The fix: every caller job that
+invokes a reusable workflow needing OIDC must also declare
 `permissions: { id-token: write, contents: read }` itself — `permissions` is one of the
 legal keys on a job that only has `uses:`. Apply this to `rollback.yml`'s caller too, when
 it's built.
@@ -345,10 +348,11 @@ since the numeric IDs aren't guessable.
 }
 ```
 
-Only `dev` entries exist today. `promote.yml` is built and ready to use `stage`/`prod`,
-but those GitHub Environments don't exist yet, so there's nothing yet for a `stage`/`prod`
-trust entry to gate. Adding `stage`/`prod` later is two more list entries per repo,
-appended to this same statement — not a new role.
+`dev` and `stage` trust entries have been added for both demo repos. The `stage` GitHub
+Environment itself (the reviewer-gated object, not just the trust entry) is confirmed
+created and tested working for `python-app`; unconfirmed for `node-app`. `prod` entries
+and the `prod` Environment are still outstanding for both. Adding an environment is always
+two more list entries per repo, appended to this same statement — not a new role.
 
 The `:environment:<env>` segment is still the load-bearing part — it ties role assumption
 to the GitHub Environment approval gate, not merely to the repository or branch. That
@@ -418,8 +422,8 @@ action — see §3) against the consumer repo's root `Dockerfile`. Configuration
 aws-cicd-framework/
 ├── .github/
 │   └── workflows/
-│       ├── deploy.yml              # built — build/test/deploy/notify, both languages
-│       ├── promote.yml             # built — S3-to-S3 image copy between environments
+│       ├── deploy.yml              # built — build/test/deploy/notify, both languages,
+│       │                           # environment-agnostic (§2.1)
 │       └── rollback.yml            # planned, not yet built
 ├── infra/                          # Terraform — only what this account permits (§10)
 │   ├── s3.tf
@@ -433,14 +437,14 @@ aws-cicd-framework/
     └── DESIGN.md
 ```
 
-No `.github/actions/` directory — composite actions aren't built yet (§3).
+No `.github/actions/` directory — composite actions aren't built yet (§3). No
+`promote.yml` — retired (§2.2).
 
 ### `aws-cicd-demo-python-app` / `aws-cicd-demo-node-app`
 
 ```
 aws-cicd-demo-<lang>-app/
-├── .github/workflows/deploy.yml    # thin caller: push-to-dev trigger
-├── .github/workflows/promote.yml   # thin caller: workflow_dispatch, manual promotion
+├── .github/workflows/deploy.yml    # thin caller: push-to-dev, PR-merge to stage/prod
 ├── Dockerfile                      # multi-stage, meets discipline checklist
 ├── .dockerignore
 ├── src/ (or app.py / index.js)     # no-op entrypoint, one exported function for tests
@@ -449,7 +453,9 @@ aws-cicd-demo-<lang>-app/
 └── README.md
 ```
 
-Rollback's trigger isn't in the caller yet — that's `rollback.yml`, not built.
+Branches: `main` (default, holds the deliverable), `dev`, `stage`, `prod` — the latter two
+now real branches, not just GitHub Environments (§4). Rollback's trigger isn't in the
+caller yet — that's `rollback.yml`, not built.
 
 ## 10. Terraform scope (framework repo `infra/`) — amended, see REQUIREMENTS.md §8
 
