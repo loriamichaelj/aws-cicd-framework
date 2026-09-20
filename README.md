@@ -146,9 +146,18 @@ AWS Console rather than via `terraform apply` — no local CLI credentials, and 
 VPC networking setup wasn't worth the friction for a one-off bucket. `infra/s3.tf` stays
 as the reference spec for its configuration.
 
-`deploy.yml` itself (build/test/deploy/notify, both languages, real unit tests and
-hadolint in the `test` job) has been unchanged since the SDLC pivot — only the demo repos'
-callers changed to add the `detect-environment` job and new triggers.
+`deploy.yml` now has a `render-manifest` job (needs `deploy`) that templates an
+ECS-compatible task definition (FR-8, pure JSON templating, no `ecs:*` calls) and writes a
+deployment manifest to S3 (FR-9) — image location, a `sha256` digest of the saved tarball
+standing in for a registry digest, build metadata, and a `previousManifestKey` pointing at
+whatever `current.json` held before this run. Verified working on a real `dev` run.
 
-Still not built: `rollback.yml`, manifest/task-definition rendering (FR-8/FR-9),
-CloudWatch recording (FR-17/FR-18), and ECR (deferred until the account has that access).
+`rollback.yml` is also built: a `workflow_dispatch`-triggered reusable workflow that
+re-points an environment's `current.json` to a prior manifest — either an explicit
+`target-sha`, or (if omitted) whatever `previousManifestKey` the current manifest points
+to. Deliberately doesn't use a separate `_rollback-history/` structure from the original
+plan; the manifest chain `render-manifest` already writes serves the same purpose. Built
+and `actionlint`-clean; not yet exercised with a real rollback run.
+
+Still not built: CloudWatch recording (FR-17/FR-18), and ECR (deferred until the account
+has that access).

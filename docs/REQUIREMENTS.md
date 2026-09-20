@@ -102,9 +102,9 @@ follow-on phase.
   for that environment. **Built.** `previousManifestKey` is derived by reading the
   environment's existing `current.json` (if any) before overwriting it — see DESIGN.md §2.1.
 - FR-10: S3 is the system of record for deployment history and rollback state. It is **not**
-  a deploy target in this phase (no running workload consumes it). **Partially built** —
-  `current.json` (the "state" pointer) is maintained; `_rollback-history/` (the "history"
-  list) is not yet, since that's `rollback.yml`'s responsibility (FR-14–16), not built yet.
+  a deploy target in this phase (no running workload consumes it). **Built** — `current.json`
+  is the "state" pointer; "history" is the manifest chain (each manifest's
+  `previousManifestKey`) rather than a separate `_rollback-history/` structure. See §8.
 
 ### 4.4 Environment promotion
 
@@ -124,11 +124,15 @@ follow-on phase.
 ### 4.5 Rollback
 
 - FR-14: The framework MUST support rollback as a distinct, **manually-triggered**
-  (`workflow_dispatch`) reusable workflow (`rollback.yml`).
+  (`workflow_dispatch`) reusable workflow (`rollback.yml`). **Built.**
 - FR-15: Rollback MUST read a prior manifest from S3 rollback history and re-point the
-  target environment's "current" manifest to it.
+  target environment's "current" manifest to it. **Built** — "S3 rollback history" is the
+  manifest chain (`previousManifestKey`) rather than a separate history structure; see §8.
 - FR-16: Rollback MUST be recorded as an event in the deployment audit trail (CloudWatch and
-  S3 history), indistinguishable in traceability from a forward deployment.
+  S3 history), indistinguishable in traceability from a forward deployment. **Partially
+  built** — the S3 side is satisfied by `current.json`'s versioning (the bucket has S3
+  versioning enabled, so every overwrite is already recoverable); the CloudWatch side
+  isn't built yet (FR-17/18).
 
 ### 4.6 Observability
 
@@ -213,7 +217,9 @@ traffic, or need to run to be considered complete.
   working** for both apps, both `stage` and `prod` — real PR merges, real S3 uploads under
   each environment's own prefix.
 - A manually dispatched rollback on any environment restores a prior manifest and is
-  recorded as a distinct, auditable event.
+  recorded as a distinct, auditable event. **Built, not yet exercised with a real run** —
+  `rollback.yml` exists and validates cleanly (`actionlint`), but hasn't been triggered
+  against real deployed manifests yet.
 - Attempting to assume the `prod` OIDC role from a workflow run not executing under the
   `prod` GitHub Environment fails.
 - Attempting to write to another environment's S3 prefix using a given environment's role
@@ -292,6 +298,15 @@ none change the manifest schema or the eventual ECS seam described in §7.
   than threading the ARN through job outputs, which would work around FR-25's intent
   (values that vary per environment should come from environment-scoped vars, not be
   passed between jobs as plain strings).
+- **`rollback.yml` reads the manifest chain, not a separate `_rollback-history/` structure
+  (FR-15).** The original plan maintained a bounded, per-environment list of prior
+  manifests in a dedicated S3 prefix. Since `render-manifest` already writes each
+  manifest's `previousManifestKey`, that chain already *is* a usable history — just a
+  linked list instead of a flat directory listing. Building a second, parallel history
+  mechanism would have been pure duplication for no added capability. Trade-off: walking
+  further back than "the previous deploy" means following the chain manually (or passing
+  an explicit `target-sha`) rather than browsing a bounded list; acceptable, since
+  `target-sha` already covers that case.
 
-None of this changes what's still deferred per §7 — ECS, `rollback.yml`, and CloudWatch
-recording remain unbuilt, independent of these amendments.
+None of this changes what's still deferred per §7 — ECS and CloudWatch recording remain
+unbuilt, independent of these amendments.

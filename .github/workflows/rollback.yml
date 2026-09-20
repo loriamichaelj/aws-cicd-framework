@@ -1,0 +1,71 @@
+name: Rollback
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        type: string
+        required: true
+      environment:
+        type: string
+        required: true
+      target-sha:
+        type: string
+        required: false
+      aws-region:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - run: |
+          CURRENT_KEY="${{ inputs.app-name }}/${{ inputs.environment }}/current.json"
+
+          if [ -n "${{ inputs.target-sha }}" ]; then
+            TARGET_KEY="${{ inputs.app-name }}/${{ inputs.environment }}/${{ inputs.target-sha }}/manifest.json"
+          else
+            aws s3 cp "s3://${{ vars.S3_BUCKET }}/$CURRENT_KEY" current.json
+            TARGET_KEY=$(jq -r '.previousManifestKey' current.json)
+            if [ -z "$TARGET_KEY" ]; then
+              echo "::error::current.json has no previousManifestKey and no target-sha was given - nothing to roll back to."
+              exit 1
+            fi
+          fi
+
+          if ! aws s3api head-object --bucket ${{ vars.S3_BUCKET }} --key "$TARGET_KEY" >/dev/null 2>&1; then
+            echo "::error::Target manifest $TARGET_KEY does not exist."
+            exit 1
+          fi
+
+          aws s3 cp "s3://${{ vars.S3_BUCKET }}/$TARGET_KEY" target-manifest.json
+          aws s3 cp target-manifest.json "s3://${{ vars.S3_BUCKET }}/$CURRENT_KEY"
+
+          TARGET_SHA=$(jq -r '.gitSha' target-manifest.json)
+          echo "rolled back ${{ inputs.app-name }} in ${{ inputs.environment }} to $TARGET_SHA ($TARGET_KEY)"
+
+  notify:
+    needs: rollback
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - if: needs.rollback.result == 'success'
+        run: |
+          echo "rollback succeeded for ${{ inputs.app-name }} in ${{ inputs.environment }}"
+
+      - if: needs.rollback.result != 'success'
+        run: |
+          echo "rollback FAILED for ${{ inputs.app-name }} in ${{ inputs.environment }}, result: ${{ needs.rollback.result }}"

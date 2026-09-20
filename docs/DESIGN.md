@@ -18,7 +18,8 @@
 │                                 inlined steps (no composite actions  │
 │                                 yet — see §3). Environment-agnostic  │
 │                                 — the caller decides which env.      │
-│    rollback.yml                planned, not yet built                │
+│    rollback.yml                built — re-points current.json via   │
+│                                 the existing manifest chain          │
 │                                                                     │
 │  infra/ (Terraform)                                                 │
 │    s3.tf                       artifact bucket — the only AWS       │
@@ -101,9 +102,11 @@ not share credentials across job boundaries**; each runs on a fresh runner and m
 authenticate independently. This is a common trip point worth documenting explicitly in
 the framework README.
 
-Not yet built: the `_rollback-history/` maintenance described in §5 (appending each
-manifest to a bounded history list) — that's part of `rollback.yml`'s job (FR-14–16), not
-`render-manifest`'s. `render-manifest` only maintains `current.json`.
+`render-manifest` only maintains `current.json`, not a separate rollback-history list —
+`rollback.yml` (§2.3, built) doesn't need one: it reads the manifest chain
+`render-manifest` already writes (each manifest's `previousManifestKey`) instead of a
+parallel `_rollback-history/` structure. The `_rollback-history/` directory described in
+§5's original S3 layout was never built; see §2.3 for why.
 
 `deploy.yml` itself is **environment-agnostic** — it has no idea whether it's being
 invoked for `dev`, `stage`, or `prod`; it just does what `inputs.environment` says. That's
@@ -127,7 +130,7 @@ reasoning and the trade-off being made. If a future need calls for the no-rebuil
 guarantee again, the git history has a complete, working reference implementation to
 restore from — this wasn't removed because it was broken.
 
-### 2.3 `rollback.yml` (planned, not yet built)
+### 2.3 `rollback.yml` (built)
 
 ```yaml
 on:
@@ -136,25 +139,38 @@ on:
       app-name: { type: string, required: true }
       environment: { type: string, required: true }
       target-sha: { type: string, required: false }  # omit = roll back to previous
-      s3-bucket: { type: string, required: true }
+      aws-region: { type: string, required: true }
 ```
 
 Triggered only via `workflow_dispatch` in the consumer (never automatic — no running
 service exists to health-check in this phase). Jobs:
 
-1. **`rollback`** — `rollback-from-manifest`: reads `_rollback-history/<app>/<environment>/`
-   for the target (or most recent prior) manifest, re-points
-   `<app>/<environment>/current.json` (or equivalent "current" pointer) to it.
-2. **`notify`** — `record-deployment-cloudwatch` with `event-type: rollback`.
+1. **`rollback`** — declares `environment: ${{ inputs.environment }}`, same pattern as
+   `deploy`/`render-manifest`. **Amended from the original plan**: rather than reading a
+   separate `_rollback-history/<app>/<environment>/` directory (never built — see §2.1),
+   this reads the manifest chain `render-manifest` already maintains. If `target-sha` is
+   given, it points directly at `<app>/<environment>/<target-sha>/manifest.json`. If
+   omitted, it reads the environment's current `current.json` and follows its own
+   `previousManifestKey` field to find the one before it. Either way, once the target
+   manifest is confirmed to exist (`s3api head-object`), its content is copied over
+   `current.json` — the actual "re-point current to a prior manifest" FR-15 describes,
+   just via the existing linked-list-of-manifests instead of a separate history structure.
+2. **`notify`** — `if: always()`, echoes success or failure based on `needs.rollback.result`.
+
+The consumer's caller is a `workflow_dispatch`-triggered thin caller, same shape as
+`promote.yml`'s was before retirement: `environment` as a dropdown (`dev`/`stage`/`prod`)
+and `target-sha` as optional free text.
 
 ## 3. Composite actions — not built; steps are inlined instead
 
 The original plan factored each step into a named composite action under
 `.github/actions/` (table below, kept for reference). In the actual build, `deploy.yml`
-inlines every step directly rather than factoring out shared logic — with `promote.yml`
-now retired (§2.2), `deploy.yml` is currently the only reusable workflow, so there's
-nothing to share a composite action between yet. Revisit once `rollback.yml` is built and
-its `configure-aws-credentials` step duplicates `deploy.yml`'s.
+and `rollback.yml` both inline every step directly rather than factoring out shared logic.
+`rollback.yml`'s `configure-aws-credentials` step now duplicates `deploy.yml`'s (a third
+occurrence, counting `render-manifest`) — genuinely the point where a composite action
+would start paying for itself, but still not factored out, since each occurrence stays
+three lines and the duplication hasn't caused a real bug yet. Revisit if a fourth
+reusable workflow gets built, or if this step grows more complex.
 
 Planned action names, if/when this gets factored out:
 
@@ -165,9 +181,9 @@ Planned action names, if/when this gets factored out:
 | `lint-dockerfile` | `dockerfile-path` | `passed` | Runs `hadolint` against the consumer's Dockerfile. Fails on any error-level finding. |
 | `docker-build-push` | `aws-region`, `docker-context`, `git-sha` | `image-location`, `image-digest` | Multi-stage build; currently uploads to S3 (see REQUIREMENTS.md §8), ECR once available. |
 | `render-task-definition` | `app-name`, `environment`, `image-location`, `container-port`, `cpu`, `memory`, `log-group` | `task-def-json-path` | **Built, inlined in `render-manifest` (§2.1)**, not a separate action. Pure templating — no AWS API calls. `executionRoleArn` is a placeholder value, documented as required-before-registration. |
-| `write-manifest-s3` | `s3-bucket`, `app-name`, `environment`, `image-location`, `image-digest`, `task-def-json-path` | `manifest-s3-key` | **Built, inlined in `render-manifest` (§2.1)**, not a separate action. Assembles manifest (see §5 schema) and uploads; maintains `current.json`. Does not yet append to rollback history — that's `rollback.yml`'s job. |
+| `write-manifest-s3` | `s3-bucket`, `app-name`, `environment`, `image-location`, `image-digest`, `task-def-json-path` | `manifest-s3-key` | **Built, inlined in `render-manifest` (§2.1)**, not a separate action. Assembles manifest (see §5 schema) and uploads; maintains `current.json`. No separate rollback-history append — `rollback.yml` (§2.3) reads the manifest chain instead. |
 | ~~`promote-artifact`~~ | — | — | **Obsolete.** Belonged to the retired artifact-copy promotion model (§2.2); the branch-rebuild SDLC has no promotion step to factor out. |
-| `rollback-from-manifest` | `s3-bucket`, `app-name`, `environment`, `target-sha` (optional) | `restored-manifest-key` | Reads rollback history; re-points "current". |
+| `rollback-from-manifest` | `s3-bucket`, `app-name`, `environment`, `target-sha` (optional) | `restored-manifest-key` | **Built, inlined in `rollback.yml`'s `rollback` job (§2.3)**, not a separate action. Follows `previousManifestKey` (or a given `target-sha`) instead of a separate history structure; re-points `current.json`. |
 | `record-deployment-cloudwatch` | `environment`, `app-name`, `event-type`, `cloudwatch-log-group` | — | Emits a custom metric and/or structured log entry. |
 
 ## 4. GitHub Environments and approval gates
@@ -237,7 +253,7 @@ jobs:
 `secrets: inherit` combined with the `deploy` job's `environment:` is what allows
 environment-scoped secrets (the shared role's ARN, per environment) to resolve correctly
 inside the reusable workflow's steps. This is exactly what `deploy.yml`'s `deploy` job
-(§2.1) already does; apply the same pattern to `rollback.yml`'s caller when it's built.
+(§2.1) and `rollback.yml`'s `rollback` job (§2.3) both do.
 
 Because GitHub only mints the `environment:<env>` claim in the OIDC token when a job is
 actually executing under that Environment's approval gate, this is also the mechanism that
@@ -256,8 +272,8 @@ e.g.: `Error calling workflow '.../deploy.yml@dev'. The nested job 'deploy' is r
 'id-token: write', but is only allowed 'id-token: none'.` The fix: every caller job that
 invokes a reusable workflow needing OIDC must also declare
 `permissions: { id-token: write, contents: read }` itself — `permissions` is one of the
-legal keys on a job that only has `uses:`. Apply this to `rollback.yml`'s caller too, when
-it's built.
+legal keys on a job that only has `uses:`. `rollback.yml`'s caller already has this, since
+it was written after the gotcha was caught.
 
 ## 5. S3 layout and manifest schema
 
@@ -283,11 +299,11 @@ s3://<bucket>/
       <git-sha>/manifest.json
       <git-sha>/task-def.json
       current.json
-    _rollback-history/           (not yet built — rollback.yml's job, not render-manifest's)
-      dev/   (last N manifests, newest first)
-      stage/
-      prod/
 ```
+
+`_rollback-history/<app>/<environment>/` from the original plan was never built —
+`rollback.yml` (§2.3) reads the manifest chain (each manifest's `previousManifestKey`)
+instead of a separate history structure, so there's no bounded-list directory to maintain.
 
 ### `manifest.json` schema (built — see §2.1)
 
@@ -444,7 +460,7 @@ aws-cicd-framework/
 │   └── workflows/
 │       ├── deploy.yml              # built — build/test/deploy/notify, both languages,
 │       │                           # environment-agnostic (§2.1)
-│       └── rollback.yml            # planned, not yet built
+│       └── rollback.yml            # built — re-points current.json via manifest chain
 ├── infra/                          # Terraform — only what this account permits (§10)
 │   ├── s3.tf
 │   ├── variables.tf
@@ -463,8 +479,9 @@ No `.github/actions/` directory — composite actions aren't built yet (§3). No
 ### `aws-cicd-demo-python-app` / `aws-cicd-demo-node-app`
 
 ```
-aws-cicd-demo-<lang>-app/
+aws-cicd-demo-<lang>-app/           # dev/stage/prod branches — main is README-only
 ├── .github/workflows/deploy.yml    # thin caller: push-to-dev, PR-merge to stage/prod
+├── .github/workflows/rollback.yml  # thin caller: workflow_dispatch, manual rollback
 ├── Dockerfile                      # multi-stage, meets discipline checklist
 ├── .dockerignore
 ├── src/ (or app.py / index.js)     # no-op entrypoint, one exported function for tests
@@ -473,9 +490,8 @@ aws-cicd-demo-<lang>-app/
 └── README.md
 ```
 
-Branches: `main` (default, holds the deliverable), `dev`, `stage`, `prod` — the latter two
-now real branches, not just GitHub Environments (§4). Rollback's trigger isn't in the
-caller yet — that's `rollback.yml`, not built.
+Branches: `main` (default — README-only signpost, not the deliverable), `dev`, `stage`,
+`prod` — the latter two real branches, not just GitHub Environments (§4).
 
 ## 10. Terraform scope (framework repo `infra/`) — amended, see REQUIREMENTS.md §8
 
