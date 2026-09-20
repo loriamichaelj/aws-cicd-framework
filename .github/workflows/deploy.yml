@@ -21,6 +21,7 @@ permissions:
 
 jobs:
   build:
+    name: Build Application
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -45,10 +46,32 @@ jobs:
           npm ci
           npm run lint
 
-  lint-dockerfile:
+  test:
+    name: Test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - if: inputs.language == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - if: inputs.language == 'python'
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
+          pytest -q
+
+      - if: inputs.language == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - if: inputs.language == 'node'
+        run: |
+          npm ci
+          npm test
 
       - uses: actions/checkout@v4
         with:
@@ -62,8 +85,9 @@ jobs:
           config: .framework/.hadolint.yaml
 
   deploy:
-    needs: [build, lint-dockerfile]
+    needs: [build, test]
     runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
     permissions:
       id-token: write
       contents: read
@@ -77,11 +101,19 @@ jobs:
 
       - run: |
           docker build -t ${{ inputs.app-name }}:${{ github.sha }} .
+          docker run --rm ${{ inputs.app-name }}:${{ github.sha }}
           docker save ${{ inputs.app-name }}:${{ github.sha }} | gzip > image.tar.gz
           aws s3 cp image.tar.gz s3://${{ vars.S3_BUCKET }}/${{ inputs.app-name }}/${{ inputs.environment }}/${{ github.sha }}/image.tar.gz
 
   notify:
     needs: deploy
+    if: always()
     runs-on: ubuntu-latest
     steps:
-      - run: echo "deployed ${{ inputs.app-name }} (${{ inputs.language }}) to ${{ inputs.environment }} at ${{ github.sha }}"
+      - if: needs.deploy.result == 'success'
+        run: |
+          echo "deployed ${{ inputs.app-name }} (${{ inputs.language }}) to ${{ inputs.environment }} at ${{ github.sha }}"
+
+      - if: needs.deploy.result != 'success'
+        run: |
+          echo "deploy FAILED for ${{ inputs.app-name }} (${{ inputs.language }}) to ${{ inputs.environment }} at ${{ github.sha }}, result: ${{ needs.deploy.result }}"

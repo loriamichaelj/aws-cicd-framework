@@ -13,20 +13,18 @@
 ┌─────────────────────────────────────────────────────────────────────┐
 │ aws-cicd-framework (public repo)                                    │
 │                                                                     │
-│  .github/workflows/          .github/actions/                       │
-│    pipeline-python.yml         build-python/                        │
-│    pipeline-node.yml           build-node/                          │
-│    promote.yml                 lint-dockerfile/                     │
-│    rollback.yml                docker-build-push-ecr/               │
-│                                 render-task-definition/             │
-│  infra/ (Terraform)            write-manifest-s3/                   │
-│    oidc-provider.tf            promote-artifact/                    │
-│    iam-roles.tf                rollback-from-manifest/              │
-│    s3.tf                       record-deployment-cloudwatch/        │
-│    ecr.tf                      assume-role-oidc/                    │
-│    cloudwatch.tf                                                    │
+│  .github/workflows/                                                 │
+│    deploy.yml                  build/test/deploy/notify jobs,       │
+│                                 inlined steps (no composite actions  │
+│                                 yet — see §3)                        │
+│    promote.yml, rollback.yml   planned, not yet built                │
+│                                                                     │
+│  infra/ (Terraform)                                                 │
+│    s3.tf                       artifact bucket — the only AWS       │
+│    variables.tf, outputs.tf    resource this repo currently         │
+│    versions.tf                 provisions (see §10)                 │
 └─────────────────────────────────────────────────────────────────────┘
-                 ▲ uses: aws-cicd-framework/.github/workflows/...@v1
+                 ▲ uses: aws-cicd-framework/.github/workflows/deploy.yml@dev
                  │
          ┌───────┴────────┐
          │                  │
@@ -38,8 +36,9 @@
 ```
 
 Each consumer repo's `.github/workflows/deploy.yml` is a **thin caller**: it checks out
-nothing itself, declares the GitHub Environment (for the approval gate), and calls the
-framework's reusable workflow with its own inputs and environment-scoped vars/secrets.
+nothing itself and calls the framework's reusable workflow with its own inputs. The
+GitHub Environment declaration (for the approval gate) lives on the *called* workflow's
+own job, not on the caller — see §4 for why.
 
 **Naming note:** GitHub repository names carry the `aws-cicd-` prefix purely for grouping
 and discoverability on GitHub (profile listing, search, topics). AWS/manifest `app-name`
@@ -48,52 +47,46 @@ intentionally decoupled from the GitHub repo name — see §5 and §6.
 
 ## 2. Reusable workflows (in `aws-cicd-framework`)
 
-### 2.1 `pipeline-python.yml` / `pipeline-node.yml`
+### 2.1 `deploy.yml` (built)
 
-Two separate files, identical shape, language-specific steps only. No shared conditional
-branching — this is a deliberate choice over a single parameterized `language` workflow, to
-keep each workflow linear and independently evolvable.
+One file, both languages, parameterized by a `language` input — chosen over two
+near-duplicate files for minimalism (see REQUIREMENTS.md §8). Steps are inlined directly
+rather than factored into composite actions; §3 covers why.
 
 ```yaml
 on:
   workflow_call:
     inputs:
       app-name: { type: string, required: true }
-      environment: { type: string, required: true }   # dev | stage | prod
+      language: { type: string, required: true }       # python | node
+      environment: { type: string, required: true }    # dev | stage | prod
       aws-region: { type: string, required: true }
-      s3-bucket: { type: string, required: true }
-      ecr-repository: { type: string, required: true }
-      build-command: { type: string, required: false }
-      lint-command: { type: string, required: false }
-    secrets:
-      # none defined here directly — consumers use `secrets: inherit` so that
-      # environment-scoped secrets (IAM_ROLE_ARN) resolve from the calling job's
-      # declared `environment:`
 ```
 
 Jobs, in order:
 
-1. **`build`** — runs `build-python` (or `build-node`) composite action: install deps,
-   run lint/syntax check. Fails fast before any Docker work begins.
-2. **`lint-dockerfile`** — runs `lint-dockerfile` composite action (hadolint) against the
-   consumer's `Dockerfile`. Blocking; a failing lint fails the pipeline. Runs in parallel
-   with `build` (needs: nothing) since it doesn't depend on build output — only merges
-   before `containerize`.
-3. **`containerize`** — `needs: [build, lint-dockerfile]`. Runs `docker-build-push-ecr`:
-   builds the multi-stage image, pushes to the per-app ECR repo, tags with Git SHA.
-   Outputs `image-uri`, `image-digest`.
-4. **`render-manifest`** — `needs: containerize`. Runs `render-task-definition` to produce
-   the task-def JSON, then `write-manifest-s3` to assemble and upload the manifest
-   (referencing the image digest and the rendered task-def).
-5. **`notify`** — `needs: render-manifest`. Runs `record-deployment-cloudwatch` with
-   `event-type: deploy`.
+1. **`build`** — checkout, language-conditional `setup-python`/`setup-node`, install
+   deps, run the lint/compile check. Fails fast before any Docker work begins.
+2. **`test`** — checkout; language-conditional install + real unit test (`pytest` or
+   `node --test`); a second checkout of `aws-cicd-framework@dev` (for `.hadolint.yaml`)
+   and a hadolint run against the consumer's `Dockerfile`. Runs in parallel with `build`
+   (needs: nothing) — both jobs only merge before `deploy`.
+3. **`deploy`** — `needs: [build, test]`. Declares `environment: ${{ inputs.environment }}`
+   (see §4). Assumes the shared AWS role via OIDC, `docker build`s the image, `docker
+   run --rm`s it as a smoke test, then `docker save | gzip`s it and uploads the tarball to
+   S3 (see §5 for the key layout and §8 in REQUIREMENTS.md for why S3 instead of ECR).
+4. **`notify`** — `needs: deploy`. Currently an echo placeholder; CloudWatch recording is
+   not yet built (see §7 in REQUIREMENTS.md).
 
-Every job that touches AWS begins with `assume-role-oidc` (or the equivalent inline
-`aws-actions/configure-aws-credentials` step) — **jobs do not share credentials across job
-boundaries**; each runs on a fresh runner and must authenticate independently. This is a
-common trip point worth documenting explicitly in the framework README.
+Every job that touches AWS begins its own `configure-aws-credentials` step — **jobs do
+not share credentials across job boundaries**; each runs on a fresh runner and must
+authenticate independently. This is a common trip point worth documenting explicitly in
+the framework README.
 
-### 2.2 `promote.yml`
+Not yet built at all: `render-task-definition` and `write-manifest-s3` equivalents (FR-8,
+FR-9). Adding them is a new job between `deploy` and `notify`, not a redesign.
+
+### 2.2 `promote.yml` (planned, not yet built)
 
 ```yaml
 on:
@@ -108,20 +101,21 @@ on:
 
 Jobs:
 
-1. **`promote`** — `promote-artifact`: reads the manifest at
-   `<app>/<source-environment>/<git-sha>/manifest.json`, copies it (and its embedded
-   references — it does not re-render or rebuild anything) to
-   `<app>/<target-environment>/<git-sha>/manifest.json`. The image in ECR is untouched;
+1. **`promote`** — reads the manifest at `<app>/<source-environment>/<git-sha>/manifest.json`,
+   copies it (and its embedded references — it does not re-render or rebuild anything) to
+   `<app>/<target-environment>/<git-sha>/manifest.json`. The image artifact is untouched;
    only the pointer moves.
-2. **`notify`** — `record-deployment-cloudwatch` with `event-type: promote`.
+2. **`notify`** — records `event-type: promote`.
 
-The **calling** consumer workflow (in `aws-cicd-demo-python-app` / `aws-cicd-demo-node-app`) declares
-`environment: stage` or `environment: prod` on the job that invokes this — that's where the
-GitHub Environment approval gate actually lives (see §4). `promote.yml` itself has no
-knowledge of approval gates; it is gate-agnostic by design, which keeps it reusable for any
-future consumer without assumptions about their approval policy.
+Both jobs live inside `promote.yml`, so **the `promote` job itself** declares
+`environment: ${{ inputs.target-environment }}` — that's where the GitHub Environment
+approval gate actually lives (see §4). The consumer's *calling* job (in
+`aws-cicd-demo-python-app` / `aws-cicd-demo-node-app`) must NOT declare `environment:` —
+GitHub Actions doesn't allow that key on a job that only has `uses:`. `promote.yml` is
+still gate-agnostic in the sense that matters: it takes the target environment as an
+input and lets whatever environment exists in the calling repo govern the gate.
 
-### 2.3 `rollback.yml`
+### 2.3 `rollback.yml` (planned, not yet built)
 
 ```yaml
 on:
@@ -141,54 +135,77 @@ service exists to health-check in this phase). Jobs:
    `<app>/<environment>/current.json` (or equivalent "current" pointer) to it.
 2. **`notify`** — `record-deployment-cloudwatch` with `event-type: rollback`.
 
-## 3. Composite actions (in `aws-cicd-framework/.github/actions/`)
+## 3. Composite actions — not built; steps are inlined instead
+
+The original plan factored each step into a named composite action under
+`.github/actions/` (table below, kept for reference). In the actual build, `deploy.yml`
+inlines every step directly — with only one reusable workflow built so far, there's
+nothing yet for a composite action to be *reused between*, so factoring them out added
+indirection without buying anything. Revisit this once `promote.yml`/`rollback.yml` exist
+and duplicate logic (e.g. the OIDC assume-role step) actually starts repeating across
+files.
+
+Planned action names, if/when this gets factored out:
 
 | Action | Inputs | Outputs | Notes |
 |---|---|---|---|
 | `build-python` | `build-command`, `lint-command`, `working-directory` | — | `actions/setup-python`, install, lint. No Docker. |
 | `build-node` | `build-command`, `lint-command`, `working-directory` | — | `actions/setup-node`, install, lint. No Docker. |
-| `lint-dockerfile` | `dockerfile-path` | `passed` | Runs `hadolint` (via its official Docker image or GitHub Action) against the consumer's Dockerfile. Fails the step on any error-level finding. |
-| `docker-build-push-ecr` | `ecr-repository`, `aws-region`, `docker-context`, `git-sha` | `image-uri`, `image-digest` | Multi-stage build; tags `<git-sha>` and optionally `<env>-latest`. |
-| `render-task-definition` | `app-name`, `environment`, `image-uri`, `container-port`, `cpu`, `memory`, `log-group` | `task-def-json-path` | **Pure templating — no AWS API calls.** Produces a syntactically valid ECS task-def JSON. `executionRoleArn` is a placeholder value, documented as required-before-registration. |
-| `write-manifest-s3` | `s3-bucket`, `app-name`, `environment`, `image-uri`, `image-digest`, `task-def-json-path` | `manifest-s3-key` | Assembles manifest (see §5 schema) and uploads. Also updates the environment's "current" pointer and appends to rollback history. |
+| `lint-dockerfile` | `dockerfile-path` | `passed` | Runs `hadolint` against the consumer's Dockerfile. Fails on any error-level finding. |
+| `docker-build-push` | `aws-region`, `docker-context`, `git-sha` | `image-location`, `image-digest` | Multi-stage build; currently uploads to S3 (see REQUIREMENTS.md §8), ECR once available. |
+| `render-task-definition` | `app-name`, `environment`, `image-location`, `container-port`, `cpu`, `memory`, `log-group` | `task-def-json-path` | **Pure templating — no AWS API calls.** Produces a syntactically valid ECS task-def JSON. `executionRoleArn` is a placeholder value, documented as required-before-registration. |
+| `write-manifest-s3` | `s3-bucket`, `app-name`, `environment`, `image-location`, `image-digest`, `task-def-json-path` | `manifest-s3-key` | Assembles manifest (see §5 schema) and uploads. Also updates the environment's "current" pointer and appends to rollback history. |
 | `promote-artifact` | `s3-bucket`, `app-name`, `source-environment`, `target-environment`, `git-sha` | `promoted-manifest-key` | Copy-only. No rebuild, no re-render. |
 | `rollback-from-manifest` | `s3-bucket`, `app-name`, `environment`, `target-sha` (optional) | `restored-manifest-key` | Reads rollback history; re-points "current". |
 | `record-deployment-cloudwatch` | `environment`, `app-name`, `event-type`, `cloudwatch-log-group` | — | Emits a custom metric and/or structured log entry. |
-| `assume-role-oidc` | `role-arn`, `aws-region` | — | Thin wrapper around `aws-actions/configure-aws-credentials` for consistency; used at the top of every AWS-touching job. |
 
 ## 4. GitHub Environments and approval gates
 
 Three GitHub Environments exist in **each consumer repo** (not in the framework repo):
 `dev`, `stage`, `prod`.
 
-- `dev`: no required reviewers. Auto-triggered on push to the `dev` branch.
-- `stage`: required reviewer(s) configured. Promotion job in the consumer's caller workflow
-  declares `environment: stage`.
+- `dev`: no required reviewers. Auto-triggered on push to the `dev` branch. Built today.
+- `stage`: required reviewer(s) configured. The promotion job *inside* `promote.yml`
+  declares `environment: stage` (not the consumer's caller job — see below). Not built.
 - `prod`: required reviewer(s) configured (recommend a distinct reviewer set from `stage`).
-  Promotion job declares `environment: prod`.
+  The promotion job declares `environment: prod`, same placement. Not built.
 
-**Critical mechanic:** the approval gate is enforced by GitHub at the **job level in the
-calling workflow**, not inside the reusable workflow. A reusable workflow (`promote.yml`)
-cannot itself declare an environment gate that governs the caller — the caller's job must
-say:
+**Critical mechanic, corrected from the original spec:** GitHub Actions does not allow
+`environment:` on a job that only has `uses:` (calls a reusable workflow) — `actionlint`
+rejects it, and it's not in GitHub's documented list of supported keywords for that job
+shape (`name`, `uses`, `with`, `secrets`, `needs`, `if`, `permissions`). The `environment:`
+declaration has to live on the reusable workflow's *own* job — the one that actually has
+`runs-on:` and does the AWS work. GitHub still resolves that environment against the
+*calling* repository (that's how `secrets: inherit` and environment-scoped vars work at
+all), so the mechanism holds; it's just declared in a different file than you'd expect:
 
 ```yaml
+# In the consumer's caller workflow — no `environment:` here:
 jobs:
   promote-to-prod:
-    environment: prod
     uses: <your-username>/aws-cicd-framework/.github/workflows/promote.yml@v1
     with:
       app-name: python-app
       source-environment: stage
       target-environment: prod
       git-sha: ${{ inputs.git-sha }}
-      s3-bucket: ${{ vars.S3_BUCKET }}
     secrets: inherit
 ```
 
-`secrets: inherit` combined with the job's `environment: prod` is what allows
-environment-scoped secrets (`IAM_ROLE_ARN` for the prod OIDC role) to resolve correctly
-inside the reusable workflow's steps.
+```yaml
+# Inside promote.yml itself — the job that does the work declares it:
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.target-environment }}
+    steps: ...
+```
+
+`secrets: inherit` combined with the `promote` job's `environment:` is what allows
+environment-scoped secrets (the shared role's ARN, per environment) to resolve correctly
+inside the reusable workflow's steps — same effect as originally intended, corrected
+placement. This is exactly what `deploy.yml`'s `deploy` job already does (§2.1); apply
+the same pattern to `promote.yml`/`rollback.yml` when they're built.
 
 Because GitHub only mints the `environment:<env>` claim in the OIDC token when a job is
 actually executing under that Environment's approval gate, this is also the mechanism that
@@ -225,7 +242,7 @@ s3://<bucket>/
       prod/
 ```
 
-### `manifest.json` schema
+### `manifest.json` schema (not yet built — see §2.1)
 
 ```json
 {
@@ -254,87 +271,85 @@ phase, where a `deploy-ecs-service` action would set it `true` and add a
 `registeredArn`/`serviceUpdateId` field. This is the explicit forward-compatibility seam
 called out in REQUIREMENTS.md §7 — no schema migration needed when that phase begins.
 
-## 6. IAM design
+`image.uri` above shows the eventual ECR form; currently it would hold the S3 key from
+`deploy.yml`'s image-save step instead (`<app-name>/<environment>/<git-sha>/image.tar.gz`)
+— see REQUIREMENTS.md §8. This whole section is moot until write-manifest-s3 is actually
+built (§2.1), at which point build it against whichever storage is current.
 
-### 6.1 Roles
+## 6. IAM design (amended — shared role, not per-environment. See REQUIREMENTS.md §8)
 
-Three roles, one per environment: `loria-gha-deploy-dev`, `loria-gha-deploy-stage`, `loria-gha-deploy-prod`.
+### 6.1 Role
 
-### 6.2 Trust policy (per role — example for `prod`)
+One pre-existing shared GitHub Actions OIDC role, already in use by other projects in
+this AWS account, before this project ever touched it. This repo does not create it and
+does not manage its full policy — no `iam:CreateRole`/`iam:CreateOpenIDConnectProvider`
+permissions were available. Its trust and permissions policies are edited directly in
+AWS, not via this repo's Terraform (see §10).
 
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": {
-        "Federated": "arn:aws:iam::<account-id>:oidc-provider/token.actions.githubusercontent.com"
-      },
-      "Action": "sts:AssumeRoleWithWebIdentity",
-      "Condition": {
-        "StringEquals": {
-          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-          "token.actions.githubusercontent.com:sub": "repo:<your-username>/aws-cicd-demo-python-app:environment:prod"
-        }
-      }
-    }
-  ]
-}
-```
+### 6.2 Trust policy (statements added for this project)
 
-Repeat for the second consumer (`aws-cicd-demo-node-app`) — multiple `sub` values via a
-condition list on the same shared per-environment role, rather than 2×3 roles. Both demo
-repos assume the same `loria-gha-deploy-prod` role; the trust policy's `StringEquals` condition
-becomes a list of both repos' `sub` values for that environment.
-
-The `:environment:prod` segment is the load-bearing part — it ties role assumption to the
-GitHub Environment approval gate, not merely to the repository or branch.
-
-### 6.3 Permissions policy (per role — example for `prod`, S3 + ECR + CloudWatch only)
+This account's GitHub repos use **immutable subject claims** (GitHub Settings → Actions →
+OIDC, enabled automatically for repos created after 2026-07-15): the `sub` claim embeds
+each repo's immutable owner/repo IDs, not just their names, e.g.
+`repo:<owner>@<owner-id>/<repo>@<repo-id>:environment:<env>` rather than the older
+`repo:<owner>/<repo>:environment:<env>`. Each consumer repo's exact prefix is shown on its
+own **Settings → Actions → OIDC** page — copy it from there rather than constructing it,
+since the numeric IDs aren't guessable.
 
 ```json
 {
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "S3ScopedToProdPrefix",
-      "Effect": "Allow",
-      "Action": ["s3:PutObject", "s3:GetObject", "s3:ListBucket"],
-      "Resource": [
-        "arn:aws:s3:::<bucket>/*/prod/*",
-        "arn:aws:s3:::<bucket>"
-      ],
-      "Condition": {
-        "StringLike": { "s3:prefix": ["*/prod/*"] }
-      }
-    },
-    {
-      "Sid": "EcrPushPullSharedAcrossEnvs",
-      "Effect": "Allow",
-      "Action": [
-        "ecr:GetAuthorizationToken",
-        "ecr:BatchCheckLayerAvailability",
-        "ecr:GetDownloadUrlForLayer",
-        "ecr:PutImage",
-        "ecr:InitiateLayerUpload",
-        "ecr:UploadLayerPart",
-        "ecr:CompleteLayerUpload"
-      ],
-      "Resource": [
-        "arn:aws:ecr:<region>:<account-id>:repository/python-app",
-        "arn:aws:ecr:<region>:<account-id>:repository/node-app"
+  "Effect": "Allow",
+  "Principal": {
+    "Federated": "arn:aws:iam::<account-id>:oidc-provider/token.actions.githubusercontent.com"
+  },
+  "Action": "sts:AssumeRoleWithWebIdentity",
+  "Condition": {
+    "StringEquals": {
+      "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+      "token.actions.githubusercontent.com:sub": [
+        "repo:<owner>@<owner-id>/aws-cicd-demo-python-app@<repo-id>:environment:dev",
+        "repo:<owner>@<owner-id>/aws-cicd-demo-node-app@<repo-id>:environment:dev"
       ]
-    },
-    {
-      "Sid": "CloudWatchScopedToProdLogGroup",
-      "Effect": "Allow",
-      "Action": ["logs:CreateLogStream", "logs:PutLogEvents", "logs:PutMetricData"],
-      "Resource": "arn:aws:logs:<region>:<account-id>:log-group:/aws-cicd/prod/*"
     }
-  ]
+  }
 }
 ```
+
+Only `dev` entries exist today, since `stage`/`prod` environments and `promote.yml` don't
+exist yet. Adding `stage`/`prod` later is two more list entries per repo, appended to
+this same statement — not a new role.
+
+The `:environment:<env>` segment is still the load-bearing part — it ties role assumption
+to the GitHub Environment approval gate, not merely to the repository or branch. That
+property holds regardless of whether the role is per-environment or shared: a workflow
+run still can't assume the role unless it's executing under the matching GitHub
+Environment.
+
+### 6.3 Permissions policy (statement added for this project's artifact bucket)
+
+This project's addition is scoped to its own dedicated bucket, appended as separate
+statements alongside whatever else the shared role's policy already grants for other
+projects — not a replacement of the existing policy:
+
+```json
+[
+  {
+    "Sid": "ListLoriaAwsCicdArtifacts",
+    "Effect": "Allow",
+    "Action": "s3:ListBucket",
+    "Resource": "arn:aws:s3:::loria-aws-cicd-artifacts-<account-id>"
+  },
+  {
+    "Sid": "ReadWriteLoriaAwsCicdArtifacts",
+    "Effect": "Allow",
+    "Action": ["s3:PutObject", "s3:GetObject", "s3:AbortMultipartUpload"],
+    "Resource": "arn:aws:s3:::loria-aws-cicd-artifacts-<account-id>/*"
+  }
+]
+```
+
+(Append these two objects into the existing policy's top-level `Statement` array — this
+fragment is shown as its own array only for readability here.)
 
 **Explicitly absent in this phase:** any `ecs:*` action, any `iam:PassRole`. Do not add
 these ahead of need — see REQUIREMENTS.md FR-23. Adding them later as a visible,
@@ -342,17 +357,17 @@ reviewable diff is itself a demonstrable least-privilege practice.
 
 ## 7. Dockerfile linting integration
 
-`lint-dockerfile` composite action wraps `hadolint` (either the official Docker image
-`hadolint/hadolint` run via `docker run`, or the `hadolint/hadolint-action` GitHub Action).
-Configuration:
+The `test` job (§2.1) runs `hadolint/hadolint-action` directly (inlined, no composite
+action — see §3) against the consumer repo's root `Dockerfile`. Configuration:
 
-- Runs against the consumer repo's root `Dockerfile` (path parameterized via
-  `dockerfile-path` input for flexibility).
-- Fails the step (and therefore the pipeline) on any hadolint error-level finding.
-- A `.hadolint.yaml` config MAY live in the framework repo and be referenced by consumers,
-  to centrally control which rules are enforced/ignored — recommended so the discipline
-  checklist in REQUIREMENTS.md §4.2.1 is enforced consistently rather than left to each
-  consumer's interpretation.
+- Fails the step (and therefore the pipeline) on any hadolint error-level finding
+  (`.hadolint.yaml`'s `failure-threshold: style`).
+- `.hadolint.yaml` lives in the framework repo, not each consumer. The `test` job checks
+  out `aws-cicd-framework@dev` a second time (`path: .framework`) to reach it, since the
+  reusable workflow's own repo checkout otherwise only gets the *calling* repo's files.
+  This centrally controls which rules are enforced/ignored, so the discipline checklist
+  in REQUIREMENTS.md §4.2.1 is enforced consistently rather than left to each consumer's
+  interpretation.
 
 ## 8. Versioning
 
@@ -371,62 +386,57 @@ Configuration:
 ```
 aws-cicd-framework/
 ├── .github/
-│   ├── workflows/
-│   │   ├── pipeline-python.yml
-│   │   ├── pipeline-node.yml
-│   │   ├── promote.yml
-│   │   ├── rollback.yml
-│   │   └── ci-self-test.yml        # lints/validates the framework's own YAML
-│   └── actions/
-│       ├── build-python/action.yml
-│       ├── build-node/action.yml
-│       ├── lint-dockerfile/action.yml
-│       ├── docker-build-push-ecr/action.yml
-│       ├── render-task-definition/action.yml
-│       ├── write-manifest-s3/action.yml
-│       ├── promote-artifact/action.yml
-│       ├── rollback-from-manifest/action.yml
-│       ├── record-deployment-cloudwatch/action.yml
-│       └── assume-role-oidc/action.yml
-├── infra/                          # Terraform for supporting AWS resources
-│   ├── oidc-provider.tf
-│   ├── iam-roles.tf
+│   └── workflows/
+│       ├── deploy.yml              # built — build/test/deploy/notify, both languages
+│       ├── promote.yml             # planned, not yet built
+│       └── rollback.yml            # planned, not yet built
+├── infra/                          # Terraform — only what this account permits (§10)
 │   ├── s3.tf
-│   ├── ecr.tf
-│   ├── cloudwatch.tf
 │   ├── variables.tf
-│   └── outputs.tf
+│   ├── outputs.tf
+│   └── versions.tf
 ├── .hadolint.yaml
-├── README.md                       # includes the "why Docker/ECR exist pre-runtime" note
-│                                    # and the "Roadmap / ECS phase" note
+├── README.md
 └── docs/
     ├── REQUIREMENTS.md
     └── DESIGN.md
 ```
 
+No `.github/actions/` directory — composite actions aren't built yet (§3).
+
 ### `aws-cicd-demo-python-app` / `aws-cicd-demo-node-app`
 
 ```
 aws-cicd-demo-<lang>-app/
-├── .github/workflows/deploy.yml    # thin caller: build/deploy + promote + rollback triggers
+├── .github/workflows/deploy.yml    # thin caller: push-to-dev trigger only, for now
 ├── Dockerfile                      # multi-stage, meets discipline checklist
 ├── .dockerignore
-├── src/ (or app.py / index.js)     # no-op entrypoint, no functional logic
+├── src/ (or app.py / index.js)     # no-op entrypoint, one exported function for tests
+├── tests/ | test/                  # one unit test exercising that function
 ├── requirements.txt | package.json # one real dependency
 └── README.md
 ```
 
-## 10. Terraform scope (framework repo `infra/`)
+Promote/rollback triggers aren't in the caller yet — that's `promote.yml`/`rollback.yml`,
+not built.
 
-Provisions, once, shared across both demo consumers:
+## 10. Terraform scope (framework repo `infra/`) — amended, see REQUIREMENTS.md §8
 
-- GitHub OIDC provider in AWS (`aws_iam_openid_connect_provider`).
-- Three IAM roles (dev/stage/prod) with trust and permission policies as in §6.
-- One S3 bucket (shared, prefix-isolated per app/environment — see §5).
-- Two ECR repositories (`python-app`, `node-app`) — per-app, per FR-22.
-- Three CloudWatch log groups (per environment — `/aws-cicd/dev/*`, `/aws-cicd/stage/*`,
-  `/aws-cicd/prod/*`; short logical prefix, consistent with S3/ECR naming per §5).
+This account's IAM permissions turned out not to include `iam:CreateRole` or
+`iam:CreateOpenIDConnectProvider` (a shared role/provider already existed for other
+projects), and no ECR access. What this repo actually provisions:
 
-This is applied once via `terraform apply` as a bootstrap step, not part of any GitHub
-Actions run in this phase (no pipeline job manages its own IAM/infra — that would be a
-privilege-escalation smell worth avoiding even in a demo).
+- One S3 bucket (`loria-aws-cicd-artifacts-<account-id>`), for saved image tarballs and
+  eventually deployment manifests — versioned, encrypted, public access fully blocked.
+
+Not provisioned by this repo, and not planned to be unless account permissions change:
+
+- The GitHub OIDC provider and the shared IAM role — pre-existing, managed directly in
+  AWS by whoever administers this account.
+- ECR repositories — no access to create them in this account currently.
+- CloudWatch log groups — not yet needed, since CloudWatch recording (FR-17/FR-18) isn't
+  built.
+
+Applied once via `terraform apply` as a bootstrap step, not part of any GitHub Actions run
+(no pipeline job manages its own infra — that would be a privilege-escalation smell worth
+avoiding even in a demo).

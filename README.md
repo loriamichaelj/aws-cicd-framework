@@ -10,11 +10,12 @@ Consumer repositories do not copy this pipeline. They call it by reference:
 ```yaml
 jobs:
   deploy:
-    environment: dev
-    uses: loriamichaelj/aws-cicd-framework/.github/workflows/pipeline-python.yml@v1
+    uses: loriamichaelj/aws-cicd-framework/.github/workflows/deploy.yml@dev
     with:
       app-name: python-app
+      language: python
       environment: dev
+      aws-region: us-east-1
     secrets: inherit
 ```
 

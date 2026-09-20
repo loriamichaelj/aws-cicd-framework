@@ -22,7 +22,8 @@ follow-on phase.
 
 - Produce a **reusable pipeline** that other repositories consume by reference
   (`uses: <your-username>/aws-cicd-framework/...@<version>`), not by copy-paste.
-- Support **Python and Node.js** consumers via parallel, non-branching reusable workflows.
+- Support **Python and Node.js** consumers via a single reusable workflow, parameterized
+  by a `language` input.
 - Demonstrate **environment promotion** (dev → stage → prod) where the same built artifact is
   promoted forward, never rebuilt per environment.
 - Demonstrate **approval-gated releases** using native GitHub Environments.
@@ -51,9 +52,9 @@ follow-on phase.
 
 ### 4.1 Build
 
-- FR-1: The framework MUST support building Python and Node.js projects via separate,
-  non-conditional reusable workflows (no shared `language` branching inside a single
-  workflow).
+- FR-1: The framework MUST support building Python and Node.js projects via a single
+  reusable workflow (`deploy.yml`), parameterized by a `language` input (`python` |
+  `node`). *Amended from the original no-branching requirement — see §8.*
 - FR-2: Each language's build job MUST run a fast-fail lint/syntax check before any Docker
   build is attempted.
 - FR-3: Build steps MUST be parameterized (build/test commands, working directory) via
@@ -63,8 +64,11 @@ follow-on phase.
 
 - FR-4: The framework MUST build a Docker image via a **multi-stage Dockerfile** for each
   consumer.
-- FR-5: Images MUST be pushed to a **per-application** Amazon ECR repository, tagged with
-  the Git SHA (and optionally a floating `<env>-latest` tag).
+- FR-5: Images MUST be published to per-application storage, tagged with the Git SHA.
+  *Currently: saved via `docker save` and uploaded to a dedicated S3 bucket, since the
+  account's shared GitHub Actions role does not yet have ECR permissions. ECR (a
+  per-application repository, floating `<env>-latest` tag optional) remains the target
+  once that access exists — see §8.*
 - FR-6: Every consumer Dockerfile MUST be validated by a **Dockerfile linter (hadolint)**
   as a required pipeline step. A failing lint MUST fail the pipeline.
 - FR-7: Consumer Dockerfiles MUST satisfy the containerization discipline checklist in
@@ -90,9 +94,10 @@ follow-on phase.
   a build output. It MUST NOT call `ecs:RegisterTaskDefinition` or any other ECS API in this
   phase.
 - FR-9: The framework MUST write a **deployment manifest** to S3 for every build, containing
-  at minimum: Git SHA, ECR image URI and digest, pointer to the rendered task definition,
-  build timestamp, triggering workflow run ID, triggering actor, and a reference to the
-  previous manifest for that environment.
+  at minimum: Git SHA, image storage location and digest (ECR URI, or the S3 key
+  currently used per FR-5), pointer to the rendered task definition, build timestamp,
+  triggering workflow run ID, triggering actor, and a reference to the previous manifest
+  for that environment. *Not yet built — see §8.*
 - FR-10: S3 is the system of record for deployment history and rollback state. It is **not**
   a deploy target in this phase (no running workload consumes it).
 
@@ -124,16 +129,20 @@ follow-on phase.
 
 - FR-19: All AWS authentication MUST use GitHub OIDC federation. No long-lived AWS access
   keys anywhere in the framework or consumer repos.
-- FR-20: There MUST be exactly one IAM role per environment (dev, stage, prod), each trust-scoped
-  such that the role can only be assumed by a workflow run executing under that specific
-  GitHub Environment (i.e., the OIDC trust condition matches on
-  `...:environment:<env>`, not merely on repository).
-- FR-21: Each environment's IAM role permissions MUST be scoped by resource ARN to that
-  environment's S3 prefix and CloudWatch log group only. No role may access another
-  environment's resources.
-- FR-22: ECR permissions MAY be shared across environments at the per-application repository
-  level (the image is the same artifact promoted across environments; only the manifest
-  pointer changes per environment).
+- FR-20: Each workflow run MUST only be able to assume an AWS role while executing under
+  a specific GitHub Environment (i.e., the OIDC trust condition matches on
+  `...:environment:<env>`, not merely on repository). *Amended: this phase uses one
+  pre-existing shared IAM role (not created by this repo) rather than one role created
+  per environment — its trust policy holds a `sub` entry per repo+environment. See §8.*
+- FR-21: IAM permissions MUST be scoped by resource ARN to the specific S3 bucket/prefix
+  and CloudWatch log group the pipeline actually uses. *Amended: with a single shared
+  role serving all environments (see FR-20), scoping is currently per-bucket rather than
+  per-environment-prefix. Per-environment resource isolation is deferred until per-environment
+  roles are possible — see §8.*
+- FR-22: ECR permissions, if in use, MAY be shared across environments at the
+  per-application repository level (the image is the same artifact promoted across
+  environments; only the manifest pointer changes per environment). *Not currently
+  applicable — see FR-5.*
 - FR-23: No IAM role in this phase may hold `ecs:*` or `iam:PassRole` permissions. These are
   explicitly deferred to the future ECS phase (see §7).
 
@@ -178,9 +187,10 @@ traffic, or need to run to be considered complete.
 
 ## 6. Acceptance Criteria
 
-- A push to `dev` in either demo repo triggers build → lint → Dockerfile lint (hadolint) →
-  containerize → push to ECR → render task definition → write manifest to S3 → CloudWatch
-  event, with no manual approval required.
+- A push to `dev` in either demo repo triggers build → test (unit tests + hadolint) →
+  containerize → save image to S3 (see FR-5) → render task definition → write manifest to
+  S3 → CloudWatch event, with no manual approval required. *The render-task-definition,
+  write-manifest, and CloudWatch steps are not yet built — see §8.*
 - A manually dispatched promotion from `dev` to `stage`, and from `stage` to `prod`, succeeds only
   after the corresponding GitHub Environment's required reviewer approves, and results in the
   **same image digest** being referenced in the promoted manifest (provable by comparing
@@ -207,3 +217,37 @@ definition are structured so this phase can be added without redesigning the fra
 - Addition of scoped `ecs:*` and narrowly-scoped `iam:PassRole` (limited to the task
   execution role ARN) permissions to the relevant environment IAM roles at that time.
 - Health-check-driven automatic rollback, once a real running service exists to check.
+
+## 8. Amendments to the Locked Spec (Current Build)
+
+This account turned out to have tighter permissions than assumed when this spec was
+locked: no ability to create IAM roles or an OIDC provider, and no ECR access. Rather
+than block on that, the following amendments were made mid-build. All are reversible —
+none change the manifest schema or the eventual ECS seam described in §7.
+
+- **Single reusable workflow, not two (FR-1).** `deploy.yml` handles both languages via a
+  `language` input instead of separate `pipeline-python.yml`/`pipeline-node.yml` files.
+  Chosen for minimalism; revisit only if the two languages' steps diverge enough to
+  justify a split.
+- **Images stored in S3, not ECR, for now (FR-5, FR-9, FR-22).** The account's shared
+  GitHub Actions role has no ECR permissions. Images are `docker save`'d, gzipped, and
+  uploaded to a dedicated S3 bucket (`infra/s3.tf`) instead of pushed to a registry.
+  Swapping this for an ECR push later is a contained change to one step in `deploy.yml`.
+- **One shared IAM role, not one per environment (FR-20, FR-21).** This account already
+  has a shared GitHub Actions OIDC role used by other projects; this repo does not create
+  its own IAM roles or OIDC provider (no permissions to do so). The shared role's trust
+  policy holds a `sub` condition entry per repo+environment (immutable subject claims:
+  `repo:<owner>@<owner-id>/<repo>@<repo-id>:environment:<env>`), which preserves FR-20's
+  actual security property — a workflow run still can't assume the role outside its
+  declared GitHub Environment — even though the role itself isn't environment-exclusive.
+  Per-environment resource isolation (FR-21) is correspondingly looser: permissions are
+  scoped to specific buckets, not to an environment-specific prefix within them, since one
+  role now serves all three environments.
+- **No Terraform for IAM/OIDC (§10 as originally written).** `infra/iam-roles.tf` and
+  `infra/oidc-provider.tf` were removed; the shared role's trust and permissions policies
+  are managed directly in AWS, outside this repo. `infra/s3.tf` (the artifact bucket) is
+  the only AWS resource this repo currently provisions.
+
+None of this changes what's still deferred per §7 — ECS, `promote.yml`, `rollback.yml`,
+CloudWatch recording, and manifest/task-definition rendering remain unbuilt, independent
+of these amendments.
