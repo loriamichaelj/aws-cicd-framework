@@ -23,7 +23,7 @@ jobs:
 
 | Repository | Role |
 | --- | --- |
-| **aws-cicd-framework** | Reusable workflows, composite actions, and Terraform for the supporting AWS resources. |
+| **aws-cicd-framework** | The reusable deploy workflow and a Terraform reference spec for the supporting AWS resources. |
 | [aws-cicd-demo-python-app](https://github.com/loriamichaelj/aws-cicd-demo-python-app) | Minimal Python containerization fixture that consumes the framework. |
 | [aws-cicd-demo-node-app](https://github.com/loriamichaelj/aws-cicd-demo-node-app) | Minimal Node.js containerization fixture that consumes the framework. |
 
@@ -55,7 +55,8 @@ target environment's S3 prefix. The image digest referenced in `stage` and `prod
 provably identical to the one built on `dev`.
 
 **The approval gate is an AWS precondition, not a UI formality.** The shared deploy role's
-trust policy accepts only the OIDC subject `repo:<owner>/<repo>:environment:<env>`.
+trust policy accepts only specific OIDC subjects — one per consumer repo's environment,
+using GitHub's immutable subject claim format (`repo:<owner>@<owner-id>/<repo>@<repo-id>:environment:<env>`).
 GitHub mints that claim only once a job is genuinely executing under that Environment —
 that is, after its required reviewer has approved. An unapproved job cannot assume the
 role at all.
@@ -116,9 +117,18 @@ at the latest compatible release. Consumers reference `@v1`.
 
 Under active construction on `dev`. Authentication uses a pre-existing shared GitHub
 Actions OIDC role for this AWS account rather than roles provisioned by this repo — IAM
-role/provider creation is outside the current account permissions. The role's ARN is set
-as the `AWS_DEPLOY_ROLE_ARN` GitHub Environment variable in each consumer repo; its trust
-policy is managed directly in AWS, outside Terraform.
+role/provider creation is outside the current account permissions. The role's trust
+policy trusts both demo repos' `dev` environment; its permissions policy grants access to
+this project's dedicated artifact bucket. Both policies are managed directly in AWS,
+outside Terraform.
 
-Completed so far: `deploy.yml` (the reusable build/lint/containerize pipeline) and the
-thin caller workflows in both demo repos.
+The artifact bucket (`loria-aws-cicd-artifacts-<account-id>`) was created manually in the
+AWS Console rather than via `terraform apply` — no local CLI credentials, and CloudShell's
+VPC networking setup wasn't worth the friction for a one-off bucket. `infra/s3.tf` stays
+as the reference spec for its configuration.
+
+Completed so far: `deploy.yml` (build/test/deploy/notify, both languages, real unit tests
+and hadolint in the `test` job) and the thin caller workflows in both demo repos, pushed
+to GitHub. `AWS_DEPLOY_ROLE_ARN`/`S3_BUCKET` are set as `dev` Environment variables in
+both consumer repos. Not yet exercised end-to-end — the demo repos' `dev` branches are
+committed locally but not yet pushed, so no pipeline run has actually happened yet.
