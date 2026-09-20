@@ -227,6 +227,21 @@ actually executing under that Environment's approval gate, this is also the mech
 makes IAM trust-policy scoping (§6) meaningful — approval isn't just a UI gate, it's a
 precondition for the AWS role even being assumable.
 
+**A second, related gotcha caught in real testing:** permissions cascade downward through
+`uses:` calls and can only be narrowed, never widened. `deploy.yml`'s `deploy` job (and
+`promote.yml`'s `promote` job) each request `permissions: { id-token: write, contents: read }`
+at the job level — but that request is only honored if the *calling* job also grants it.
+The consumer repos' caller jobs originally declared no `permissions:` at all, which
+defaults to `id-token: none` and silently clamps the nested job down to that, regardless
+of what the reusable workflow itself asks for. GitHub surfaces this as a hard failure at
+dispatch time (`startup_failure`, zero jobs created), not a runtime permission error inside
+a job — e.g.: `Error calling workflow '.../deploy.yml@dev'. The nested job 'deploy' is
+requesting 'id-token: write', but is only allowed 'id-token: none'.` The fix: every caller
+job that invokes a reusable workflow needing OIDC must also declare
+`permissions: { id-token: write, contents: read }` itself — `permissions` is one of the
+legal keys on a job that only has `uses:`. Apply this to `rollback.yml`'s caller too, when
+it's built.
+
 ## 5. S3 layout and manifest schema
 
 **Naming note:** all identifiers below (`app-name`, S3 prefixes, ECR repo names, CloudWatch
