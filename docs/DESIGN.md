@@ -17,7 +17,8 @@
 │    deploy.yml                  build/test/deploy/notify jobs,       │
 │                                 inlined steps (no composite actions  │
 │                                 yet — see §3)                        │
-│    promote.yml, rollback.yml   planned, not yet built                │
+│    promote.yml                 built — S3-to-S3 image copy          │
+│    rollback.yml                planned, not yet built                │
 │                                                                     │
 │  infra/ (Terraform)                                                 │
 │    s3.tf                       artifact bucket — the only AWS       │
@@ -86,7 +87,7 @@ the framework README.
 Not yet built at all: `render-task-definition` and `write-manifest-s3` equivalents (FR-8,
 FR-9). Adding them is a new job between `deploy` and `notify`, not a redesign.
 
-### 2.2 `promote.yml` (planned, not yet built)
+### 2.2 `promote.yml` (built)
 
 ```yaml
 on:
@@ -96,24 +97,32 @@ on:
       source-environment: { type: string, required: true }
       target-environment: { type: string, required: true }
       git-sha: { type: string, required: true }
-      s3-bucket: { type: string, required: true }
+      aws-region: { type: string, required: true }
 ```
 
 Jobs:
 
-1. **`promote`** — reads the manifest at `<app>/<source-environment>/<git-sha>/manifest.json`,
-   copies it (and its embedded references — it does not re-render or rebuild anything) to
-   `<app>/<target-environment>/<git-sha>/manifest.json`. The image artifact is untouched;
-   only the pointer moves.
-2. **`notify`** — records `event-type: promote`.
+1. **`promote`** — a single `aws s3 cp` copying the image tarball from
+   `<app-name>/<source-environment>/<git-sha>/image.tar.gz` to
+   `<app-name>/<target-environment>/<git-sha>/image.tar.gz` — a server-side S3-to-S3 copy,
+   no download, no rebuild. **Amended from the original plan**: the original design copied
+   a `manifest.json` pointer rather than the image itself, but manifest writing (FR-9)
+   isn't built yet, so there's no manifest to copy. Copying the image tarball directly is
+   the real artifact that exists today and achieves the same guarantee (FR-11): the exact
+   same bytes, just at a new key. Revisit once `write-manifest-s3` exists — at that point
+   this job should copy the manifest (which references the image) instead, matching the
+   original design.
+2. **`notify`** — `if: always()`, echoes success or failure based on `needs.promote.result`.
 
 Both jobs live inside `promote.yml`, so **the `promote` job itself** declares
 `environment: ${{ inputs.target-environment }}` — that's where the GitHub Environment
 approval gate actually lives (see §4). The consumer's *calling* job (in
 `aws-cicd-demo-python-app` / `aws-cicd-demo-node-app`) must NOT declare `environment:` —
-GitHub Actions doesn't allow that key on a job that only has `uses:`. `promote.yml` is
-still gate-agnostic in the sense that matters: it takes the target environment as an
-input and lets whatever environment exists in the calling repo govern the gate.
+GitHub Actions doesn't allow that key on a job that only has `uses:`. It's a
+`workflow_dispatch`-triggered thin caller with dropdown-constrained `source-environment`/
+`target-environment` inputs (prevents typos like promoting *from* prod) and a free-text
+`git-sha` — there's no way to look up "the latest dev build" automatically without the
+manifest system, so the person triggering promotion supplies it directly.
 
 ### 2.3 `rollback.yml` (planned, not yet built)
 
@@ -139,11 +148,14 @@ service exists to health-check in this phase). Jobs:
 
 The original plan factored each step into a named composite action under
 `.github/actions/` (table below, kept for reference). In the actual build, `deploy.yml`
-inlines every step directly — with only one reusable workflow built so far, there's
-nothing yet for a composite action to be *reused between*, so factoring them out added
-indirection without buying anything. Revisit this once `promote.yml`/`rollback.yml` exist
-and duplicate logic (e.g. the OIDC assume-role step) actually starts repeating across
-files.
+and `promote.yml` both inline every step directly rather than factoring out shared logic.
+
+Worth noting: with `promote.yml` now built, the `configure-aws-credentials` OIDC
+assume-role step is duplicated verbatim between `deploy.yml`'s `deploy` job and
+`promote.yml`'s `promote` job — exactly the kind of repetition that would justify a
+composite action. Not factored out yet since it's still only two occurrences and each is
+three lines; revisit once `rollback.yml` adds a third, or if the assume-role step grows
+more complex than it is today.
 
 Planned action names, if/when this gets factored out:
 
@@ -161,14 +173,17 @@ Planned action names, if/when this gets factored out:
 
 ## 4. GitHub Environments and approval gates
 
-Three GitHub Environments exist in **each consumer repo** (not in the framework repo):
+Three GitHub Environments belong in **each consumer repo** (not in the framework repo):
 `dev`, `stage`, `prod`.
 
-- `dev`: no required reviewers. Auto-triggered on push to the `dev` branch. Built today.
+- `dev`: no required reviewers. Auto-triggered on push to the `dev` branch. Created and in
+  use today.
 - `stage`: required reviewer(s) configured. The promotion job *inside* `promote.yml`
-  declares `environment: stage` (not the consumer's caller job — see below). Not built.
+  declares `environment: stage` (not the consumer's caller job — see below). `promote.yml`
+  itself is built; the `stage` Environment isn't created yet, so this path is untested.
 - `prod`: required reviewer(s) configured (recommend a distinct reviewer set from `stage`).
-  The promotion job declares `environment: prod`, same placement. Not built.
+  The promotion job declares `environment: prod`, same placement. Same status as `stage`
+  — code is built, the Environment isn't created yet.
 
 **Critical mechanic, corrected from the original spec:** GitHub Actions does not allow
 `environment:` on a job that only has `uses:` (calls a reusable workflow) — `actionlint`
@@ -204,8 +219,8 @@ jobs:
 `secrets: inherit` combined with the `promote` job's `environment:` is what allows
 environment-scoped secrets (the shared role's ARN, per environment) to resolve correctly
 inside the reusable workflow's steps — same effect as originally intended, corrected
-placement. This is exactly what `deploy.yml`'s `deploy` job already does (§2.1); apply
-the same pattern to `promote.yml`/`rollback.yml` when they're built.
+placement. This is exactly what `deploy.yml`'s `deploy` job (§2.1) and `promote.yml`'s
+`promote` job (§2.2) already do; apply the same pattern to `rollback.yml` when it's built.
 
 Because GitHub only mints the `environment:<env>` claim in the OIDC token when a job is
 actually executing under that Environment's approval gate, this is also the mechanism that
@@ -315,9 +330,10 @@ since the numeric IDs aren't guessable.
 }
 ```
 
-Only `dev` entries exist today, since `stage`/`prod` environments and `promote.yml` don't
-exist yet. Adding `stage`/`prod` later is two more list entries per repo, appended to
-this same statement — not a new role.
+Only `dev` entries exist today. `promote.yml` is built and ready to use `stage`/`prod`,
+but those GitHub Environments don't exist yet, so there's nothing yet for a `stage`/`prod`
+trust entry to gate. Adding `stage`/`prod` later is two more list entries per repo,
+appended to this same statement — not a new role.
 
 The `:environment:<env>` segment is still the load-bearing part — it ties role assumption
 to the GitHub Environment approval gate, not merely to the repository or branch. That
@@ -388,7 +404,7 @@ aws-cicd-framework/
 ├── .github/
 │   └── workflows/
 │       ├── deploy.yml              # built — build/test/deploy/notify, both languages
-│       ├── promote.yml             # planned, not yet built
+│       ├── promote.yml             # built — S3-to-S3 image copy between environments
 │       └── rollback.yml            # planned, not yet built
 ├── infra/                          # Terraform — only what this account permits (§10)
 │   ├── s3.tf
@@ -408,7 +424,8 @@ No `.github/actions/` directory — composite actions aren't built yet (§3).
 
 ```
 aws-cicd-demo-<lang>-app/
-├── .github/workflows/deploy.yml    # thin caller: push-to-dev trigger only, for now
+├── .github/workflows/deploy.yml    # thin caller: push-to-dev trigger
+├── .github/workflows/promote.yml   # thin caller: workflow_dispatch, manual promotion
 ├── Dockerfile                      # multi-stage, meets discipline checklist
 ├── .dockerignore
 ├── src/ (or app.py / index.js)     # no-op entrypoint, one exported function for tests
@@ -417,8 +434,7 @@ aws-cicd-demo-<lang>-app/
 └── README.md
 ```
 
-Promote/rollback triggers aren't in the caller yet — that's `promote.yml`/`rollback.yml`,
-not built.
+Rollback's trigger isn't in the caller yet — that's `rollback.yml`, not built.
 
 ## 10. Terraform scope (framework repo `infra/`) — amended, see REQUIREMENTS.md §8
 

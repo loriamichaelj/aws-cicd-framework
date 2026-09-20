@@ -103,12 +103,17 @@ follow-on phase.
 
 ### 4.4 Environment promotion
 
-- FR-11: The framework MUST support promoting an existing artifact (image + manifest + task
-  definition) from one environment to the next (dev → stage → prod) **without rebuilding**.
+- FR-11: The framework MUST support promoting an existing artifact from one environment to
+  the next (dev → stage → prod) **without rebuilding**. *Built as a direct S3-to-S3 copy
+  of the image tarball (see FR-5), not a manifest copy — manifest writing (FR-9) isn't
+  built yet. Same no-rebuild guarantee either way. See §8.*
 - FR-12: Promotion MUST be implemented as a distinct reusable workflow (`promote.yml`),
-  separate from the build/containerize pipeline.
+  separate from the build/containerize pipeline. *Built.*
 - FR-13: Promotion to `stage` and `prod` MUST require GitHub Environment approval gates
-  (required reviewers). Promotion/deploy to `dev` MUST NOT require approval.
+  (required reviewers). Promotion/deploy to `dev` MUST NOT require approval. *`promote.yml`
+  is built and gates correctly via `environment: ${{ inputs.target-environment }}`, but
+  the `stage`/`prod` GitHub Environments themselves don't exist yet, so this is untested
+  end-to-end.*
 
 ### 4.5 Rollback
 
@@ -193,8 +198,9 @@ traffic, or need to run to be considered complete.
   write-manifest, and CloudWatch steps are not yet built — see §8.*
 - A manually dispatched promotion from `dev` to `stage`, and from `stage` to `prod`, succeeds only
   after the corresponding GitHub Environment's required reviewer approves, and results in the
-  **same image digest** being referenced in the promoted manifest (provable by comparing
-  digests across environment manifests).
+  **exact same object** existing at the target environment's S3 key (provable by comparing
+  ETags/checksums across environment prefixes — digest-in-a-manifest once FR-9 is built).
+  Untested end-to-end today since `stage`/`prod` Environments don't exist yet — see §8.
 - A manually dispatched rollback on any environment restores a prior manifest and is
   recorded as a distinct, auditable event.
 - Attempting to assume the `prod` OIDC role from a workflow run not executing under the
@@ -251,7 +257,13 @@ none change the manifest schema or the eventual ECS seam described in §7.
   manual creation in the console was the pragmatic call. `infra/s3.tf` stays as the
   reference spec for the bucket's intended configuration (versioning, encryption,
   public-access-block) — see DESIGN.md §10.
+- **`promote.yml` copies the image tarball directly, not a manifest (FR-11).** The
+  original design copied a `manifest.json` pointer between environment prefixes; since
+  manifest writing (FR-9) isn't built, `promote.yml` copies
+  `<app-name>/<source-environment>/<git-sha>/image.tar.gz` directly instead. Same
+  no-rebuild guarantee, same server-side S3 copy — just moving the artifact that actually
+  exists today instead of a pointer to it. Revisit once FR-9 is built.
 
-None of this changes what's still deferred per §7 — ECS, `promote.yml`, `rollback.yml`,
-CloudWatch recording, and manifest/task-definition rendering remain unbuilt, independent
-of these amendments.
+None of this changes what's still deferred per §7 — ECS, `rollback.yml`, CloudWatch
+recording, and manifest/task-definition rendering remain unbuilt, independent of these
+amendments.

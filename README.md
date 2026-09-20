@@ -50,9 +50,10 @@ ECR push later is a contained change to one step.
 Three ideas carry most of the weight:
 
 **Promotion moves a pointer, not a build.** An image is built exactly once and tagged
-with its Git SHA. Promoting `dev` to `stage` copies the deployment manifest to the
-target environment's S3 prefix. The image digest referenced in `stage` and `prod` is
-provably identical to the one built on `dev`.
+with its Git SHA. Promoting `dev` to `stage` copies the saved image tarball directly to
+the target environment's S3 prefix (a server-side S3-to-S3 copy — no download, no
+rebuild). The object at `stage` and `prod` is provably the exact same bytes built on
+`dev`; this becomes a manifest-and-digest comparison once deployment manifests are built.
 
 **The approval gate is an AWS precondition, not a UI formality.** The shared deploy role's
 trust policy accepts only specific OIDC subjects — one per consumer repo's environment,
@@ -98,7 +99,7 @@ a reviewable diff is itself the least-privilege practice being demonstrated.
 
 | Branch | Contents |
 | --- | --- |
-| `main` | This README only. Entry point and signpost. |
+| `devmain` | This README only. Entry point, signpost, and GitHub default branch. |
 | `dev` | Active development. |
 | `stage` | Promoted from `dev`. |
 | `prod` | Promoted from `stage`. **The complete framework lives here.** |
@@ -128,7 +129,12 @@ VPC networking setup wasn't worth the friction for a one-off bucket. `infra/s3.t
 as the reference spec for its configuration.
 
 Completed so far: `deploy.yml` (build/test/deploy/notify, both languages, real unit tests
-and hadolint in the `test` job) and the thin caller workflows in both demo repos, pushed
-to GitHub. `AWS_DEPLOY_ROLE_ARN`/`S3_BUCKET` are set as `dev` Environment variables in
-both consumer repos. Not yet exercised end-to-end — the demo repos' `dev` branches are
-committed locally but not yet pushed, so no pipeline run has actually happened yet.
+and hadolint in the `test` job) and `promote.yml` (S3-to-S3 image copy between
+environments, gated on the target environment's approval rule), plus the thin caller
+workflows for both in each demo repo. `AWS_DEPLOY_ROLE_ARN`/`S3_BUCKET` are set as `dev`
+Environment variables in both consumer repos; `stage`/`prod` Environments don't exist yet,
+so `promote.yml` is untested end-to-end.
+
+`aws-cicd-demo-python-app`'s `dev` branch has been pushed, triggering the first real
+pipeline run. `aws-cicd-demo-node-app`'s `dev` branch is committed locally but not yet
+pushed — held back pending the python-app run's result.
