@@ -191,11 +191,42 @@ jobs:
     needs: [deploy, render-manifest]
     if: always()
     runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
     steps:
-      - if: needs.deploy.result == 'success' && needs.render-manifest.result == 'success'
-        run: |
-          echo "deployed ${{ inputs.app-name }} (${{ inputs.language }}) to ${{ inputs.environment }} at ${{ github.sha }}"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
 
-      - if: needs.deploy.result != 'success' || needs.render-manifest.result != 'success'
-        run: |
-          echo "deploy FAILED for ${{ inputs.app-name }} (${{ inputs.language }}) to ${{ inputs.environment }} at ${{ github.sha }}, deploy: ${{ needs.deploy.result }}, render-manifest: ${{ needs.render-manifest.result }}"
+      - run: |
+          RESULT="success"
+          if [ "${{ needs.deploy.result }}" != "success" ] || [ "${{ needs.render-manifest.result }}" != "success" ]; then
+            RESULT="failure"
+          fi
+
+          MESSAGE=$(jq -n \
+            --arg eventType "deploy" \
+            --arg appName "${{ inputs.app-name }}" \
+            --arg environment "${{ inputs.environment }}" \
+            --arg gitSha "${{ github.sha }}" \
+            --arg result "$RESULT" \
+            --arg workflowRunId "${{ github.run_id }}" \
+            --arg triggeredBy "${{ github.actor }}" \
+            '{eventType:$eventType, appName:$appName, environment:$environment, gitSha:$gitSha, result:$result, workflowRunId:$workflowRunId, triggeredBy:$triggeredBy}')
+
+          LOG_GROUP="/aws-cicd/${{ inputs.environment }}"
+          LOG_STREAM="${{ inputs.app-name }}"
+          aws logs create-log-stream --log-group-name "$LOG_GROUP" --log-stream-name "$LOG_STREAM" 2>/dev/null || true
+
+          TIMESTAMP=$(($(date +%s%N)/1000000))
+          jq -n --argjson ts "$TIMESTAMP" --arg msg "$MESSAGE" '[{timestamp:$ts, message:$msg}]' > log-events.json
+
+          aws logs put-log-events \
+            --log-group-name "$LOG_GROUP" \
+            --log-stream-name "$LOG_STREAM" \
+            --log-events file://log-events.json
+
+          echo "$MESSAGE"

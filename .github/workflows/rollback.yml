@@ -61,11 +61,39 @@ jobs:
     needs: rollback
     if: always()
     runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
     steps:
-      - if: needs.rollback.result == 'success'
-        run: |
-          echo "rollback succeeded for ${{ inputs.app-name }} in ${{ inputs.environment }}"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
 
-      - if: needs.rollback.result != 'success'
-        run: |
-          echo "rollback FAILED for ${{ inputs.app-name }} in ${{ inputs.environment }}, result: ${{ needs.rollback.result }}"
+      - run: |
+          RESULT="${{ needs.rollback.result }}"
+
+          MESSAGE=$(jq -n \
+            --arg eventType "rollback" \
+            --arg appName "${{ inputs.app-name }}" \
+            --arg environment "${{ inputs.environment }}" \
+            --arg targetSha "${{ inputs.target-sha }}" \
+            --arg result "$RESULT" \
+            --arg workflowRunId "${{ github.run_id }}" \
+            --arg triggeredBy "${{ github.actor }}" \
+            '{eventType:$eventType, appName:$appName, environment:$environment, targetSha:$targetSha, result:$result, workflowRunId:$workflowRunId, triggeredBy:$triggeredBy}')
+
+          LOG_GROUP="/aws-cicd/${{ inputs.environment }}"
+          LOG_STREAM="${{ inputs.app-name }}"
+          aws logs create-log-stream --log-group-name "$LOG_GROUP" --log-stream-name "$LOG_STREAM" 2>/dev/null || true
+
+          TIMESTAMP=$(($(date +%s%N)/1000000))
+          jq -n --argjson ts "$TIMESTAMP" --arg msg "$MESSAGE" '[{timestamp:$ts, message:$msg}]' > log-events.json
+
+          aws logs put-log-events \
+            --log-group-name "$LOG_GROUP" \
+            --log-stream-name "$LOG_STREAM" \
+            --log-events file://log-events.json
+
+          echo "$MESSAGE"
