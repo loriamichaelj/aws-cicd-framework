@@ -152,12 +152,22 @@ deployment manifest to S3 (FR-9) — image location, a `sha256` digest of the sa
 standing in for a registry digest, build metadata, and a `previousManifestKey` pointing at
 whatever `current.json` held before this run. Verified working on a real `dev` run.
 
-`rollback.yml` is also built: a `workflow_dispatch`-triggered reusable workflow that
-re-points an environment's `current.json` to a prior manifest — either an explicit
-`target-sha`, or (if omitted) whatever `previousManifestKey` the current manifest points
-to. Deliberately doesn't use a separate `_rollback-history/` structure from the original
-plan; the manifest chain `render-manifest` already writes serves the same purpose. Built
-and `actionlint`-clean; not yet exercised with a real rollback run.
+`rollback.yml` is also built and **confirmed working end-to-end for both apps**: a
+`workflow_dispatch`-triggered reusable workflow that re-points an environment's
+`current.json` to a prior manifest — either an explicit `target-sha`, or (if omitted)
+whatever `previousManifestKey` the current manifest points to. Deliberately doesn't use a
+separate `_rollback-history/` structure from the original plan; the manifest chain
+`render-manifest` already writes serves the same purpose. Verified against both
+`python-app` and `node-app` on `dev`, each rolling `current.json` back one real deploy,
+confirmed by inspecting the actual S3 download/upload operations.
+
+Getting `rollback.yml` dispatchable surfaced one more real constraint: GitHub requires a
+`workflow_dispatch` workflow's file to exist on a repo's *default branch* to be
+discoverable/triggerable at all — even when you then run a different branch's version of
+it via the branch selector. Both demo repos' `main` branches now carry
+`.github/workflows/` (just the workflow files, nothing else — no Dockerfile, source, or
+tests) for exactly this reason.
 
 Still not built: CloudWatch recording (FR-17/FR-18), and ECR (deferred until the account
-has that access).
+has that access). That's everything from the original build order of operations except
+CloudWatch.

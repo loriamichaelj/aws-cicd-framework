@@ -130,7 +130,7 @@ reasoning and the trade-off being made. If a future need calls for the no-rebuil
 guarantee again, the git history has a complete, working reference implementation to
 restore from — this wasn't removed because it was broken.
 
-### 2.3 `rollback.yml` (built)
+### 2.3 `rollback.yml` (built, confirmed working end-to-end for both apps)
 
 ```yaml
 on:
@@ -160,6 +160,20 @@ service exists to health-check in this phase). Jobs:
 The consumer's caller is a `workflow_dispatch`-triggered thin caller, same shape as
 `promote.yml`'s was before retirement: `environment` as a dropdown (`dev`/`stage`/`prod`)
 and `target-sha` as optional free text.
+
+Verified with real dispatches against both `python-app` and `node-app` on `dev`: each
+correctly downloaded `current.json`, followed its `previousManifestKey` to the prior
+deploy's manifest, and overwrote `current.json` with it — confirmed via the actual S3
+download/upload log lines, not just a green checkmark. `stage`/`prod` rollback untested
+(same mechanism, different environment name).
+
+**Getting this dispatchable surfaced a platform constraint, not a bug:** GitHub requires a
+`workflow_dispatch` workflow's file to exist on a repo's *default branch* to be
+discoverable/triggerable via the UI, API, or `gh` CLI at all — regardless of which
+branch's version you then choose to actually run via the branch selector. Both demo repos'
+`main` now carries `.github/workflows/` (just the two workflow files) for this reason —
+see REQUIREMENTS.md §8. `main` is still not the deliverable; `deploy.yml`'s triggers don't
+watch `main`, so the files are inert there except for making dispatch possible.
 
 ## 3. Composite actions — not built; steps are inlined instead
 
@@ -479,7 +493,7 @@ No `.github/actions/` directory — composite actions aren't built yet (§3). No
 ### `aws-cicd-demo-python-app` / `aws-cicd-demo-node-app`
 
 ```
-aws-cicd-demo-<lang>-app/           # dev/stage/prod branches — main is README-only
+aws-cicd-demo-<lang>-app/           # dev/stage/prod branches hold this full layout
 ├── .github/workflows/deploy.yml    # thin caller: push-to-dev, PR-merge to stage/prod
 ├── .github/workflows/rollback.yml  # thin caller: workflow_dispatch, manual rollback
 ├── Dockerfile                      # multi-stage, meets discipline checklist
@@ -490,8 +504,10 @@ aws-cicd-demo-<lang>-app/           # dev/stage/prod branches — main is README
 └── README.md
 ```
 
-Branches: `main` (default — README-only signpost, not the deliverable), `dev`, `stage`,
-`prod` — the latter two real branches, not just GitHub Environments (§4).
+Branches: `main` (default — README plus just `.github/workflows/`, not the deliverable;
+the workflow files exist there only so `workflow_dispatch` can find `rollback.yml`, see
+§2.3), `dev`, `stage`, `prod` — the latter two real branches, not just GitHub Environments
+(§4), each holding the full layout above.
 
 ## 10. Terraform scope (framework repo `infra/`) — amended, see REQUIREMENTS.md §8
 

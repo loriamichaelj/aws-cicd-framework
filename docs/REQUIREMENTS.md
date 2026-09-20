@@ -217,9 +217,11 @@ traffic, or need to run to be considered complete.
   working** for both apps, both `stage` and `prod` — real PR merges, real S3 uploads under
   each environment's own prefix.
 - A manually dispatched rollback on any environment restores a prior manifest and is
-  recorded as a distinct, auditable event. **Built, not yet exercised with a real run** —
-  `rollback.yml` exists and validates cleanly (`actionlint`), but hasn't been triggered
-  against real deployed manifests yet.
+  recorded as a distinct, auditable event. **Confirmed working** for both `python-app` and
+  `node-app` on `dev` — each real dispatch correctly followed `previousManifestKey` back
+  one deploy and re-pointed `current.json`, verified against the actual S3 operations.
+  `stage`/`prod` rollback untested (mechanism is identical, just a different environment
+  name — no reason to expect different behavior, but not yet exercised).
 - Attempting to assume the `prod` OIDC role from a workflow run not executing under the
   `prod` GitHub Environment fails.
 - Attempting to write to another environment's S3 prefix using a given environment's role
@@ -307,6 +309,14 @@ none change the manifest schema or the eventual ECS seam described in §7.
   further back than "the previous deploy" means following the chain manually (or passing
   an explicit `target-sha`) rather than browsing a bounded list; acceptable, since
   `target-sha` already covers that case.
+- **Both demo repos' `main` branches now carry `.github/workflows/` (FR-14).** Discovered
+  while trying to actually dispatch `rollback.yml`: GitHub requires a `workflow_dispatch`
+  workflow's file to exist on a repo's *default branch* to be discoverable/triggerable at
+  all via the UI, API, or `gh` CLI — even though you then choose which branch's version of
+  it actually runs via the branch selector. `main` still isn't the deliverable (no
+  Dockerfile, source, or tests there); it now holds the README plus just the two workflow
+  files, which is inert on `main` itself (`deploy.yml`'s triggers don't watch `main`, and
+  `rollback.yml` only runs on explicit dispatch).
 
 None of this changes what's still deferred per §7 — ECS and CloudWatch recording remain
 unbuilt, independent of these amendments.
