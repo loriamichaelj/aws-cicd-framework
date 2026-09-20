@@ -21,7 +21,7 @@ permissions:
 
 jobs:
   build:
-    name: Build Application
+    name: Build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -85,6 +85,7 @@ jobs:
           config: .framework/.hadolint.yaml
 
   deploy:
+    name: Deploy
     needs: [build, test]
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
