@@ -162,12 +162,12 @@ Three GitHub Environments belong in **each consumer repo** (not in the framework
 `dev`, `stage`, `prod`. `stage`/`prod` are also now real **branches** in each repo (a
 deliberate pivot — see §2.2), receiving PR merges as their trigger.
 
-- `dev`: no required reviewers. Auto-triggered on push to the `dev` branch. Created and in
-  use today.
+- `dev`: no required reviewers. Auto-triggered on push to the `dev` branch. Created and
+  tested working for both `python-app` and `node-app`.
 - `stage`: required reviewer(s) configured. Triggered by a PR merged into the `stage`
-  branch. Environment created and tested working for `python-app`.
-- `prod`: required reviewer(s) configured (recommend a distinct reviewer set from `stage`).
-  Triggered by a PR merged into the `prod` branch. Not yet created.
+  branch. Created and tested working for both `python-app` and `node-app`.
+- `prod`: required reviewer(s) configured. Triggered by a PR merged into the `prod`
+  branch. Created and tested working for both `python-app` and `node-app`.
 
 **Critical mechanic, corrected from the original spec:** GitHub Actions does not allow
 `environment:` on a job that only has `uses:` (calls a reusable workflow) — `actionlint`
@@ -341,18 +341,22 @@ since the numeric IDs aren't guessable.
       "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
       "token.actions.githubusercontent.com:sub": [
         "repo:<owner>@<owner-id>/aws-cicd-demo-python-app@<repo-id>:environment:dev",
-        "repo:<owner>@<owner-id>/aws-cicd-demo-node-app@<repo-id>:environment:dev"
+        "repo:<owner>@<owner-id>/aws-cicd-demo-node-app@<repo-id>:environment:dev",
+        "repo:<owner>@<owner-id>/aws-cicd-demo-python-app@<repo-id>:environment:stage",
+        "repo:<owner>@<owner-id>/aws-cicd-demo-node-app@<repo-id>:environment:stage",
+        "repo:<owner>@<owner-id>/aws-cicd-demo-python-app@<repo-id>:environment:prod",
+        "repo:<owner>@<owner-id>/aws-cicd-demo-node-app@<repo-id>:environment:prod"
       ]
     }
   }
 }
 ```
 
-`dev` and `stage` trust entries have been added for both demo repos. The `stage` GitHub
-Environment itself (the reviewer-gated object, not just the trust entry) is confirmed
-created and tested working for `python-app`; unconfirmed for `node-app`. `prod` entries
-and the `prod` Environment are still outstanding for both. Adding an environment is always
-two more list entries per repo, appended to this same statement — not a new role.
+`dev`, `stage`, and `prod` trust entries exist for both demo repos, and all three
+Environments (reviewer-gated objects, not just trust entries) are confirmed created and
+tested working for both `python-app` and `node-app` — a real PR merge into each of
+`stage`/`prod`, reviewer-gated, produced a real S3 upload. Adding another environment is
+always two more list entries per repo, appended to this same statement — not a new role.
 
 The `:environment:<env>` segment is still the load-bearing part — it ties role assumption
 to the GitHub Environment approval gate, not merely to the repository or branch. That

@@ -198,13 +198,16 @@ traffic, or need to run to be considered complete.
 
 - A push to `dev` in either demo repo triggers build → test (unit tests + hadolint) →
   containerize → save image to S3 (see FR-5) → render task definition → write manifest to
-  S3 → CloudWatch event, with no manual approval required. *The render-task-definition,
-  write-manifest, and CloudWatch steps are not yet built — see §8.*
+  S3 → CloudWatch event, with no manual approval required. **Confirmed working** for both
+  `python-app` and `node-app` through the S3-upload step; the render-task-definition,
+  write-manifest, and CloudWatch steps are not yet built — see §8.
 - A pull request merged into `stage` (or `prod`) triggers the `detect-environment` job to
   resolve the correct environment name from `github.event.pull_request.base.ref`, then
   runs the full build → test → containerize → S3-upload pipeline for that environment,
   succeeding only after the corresponding GitHub Environment's required reviewer approves.
-  A pull request that's closed *without* merging MUST NOT trigger a deploy.
+  A pull request that's closed *without* merging MUST NOT trigger a deploy. **Confirmed
+  working** for both apps, both `stage` and `prod` — real PR merges, real S3 uploads under
+  each environment's own prefix.
 - A manually dispatched rollback on any environment restores a prior manifest and is
   recorded as a distinct, auditable event.
 - Attempting to assume the `prod` OIDC role from a workflow run not executing under the

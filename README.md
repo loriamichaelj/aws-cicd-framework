@@ -118,32 +118,37 @@ at the latest compatible release. Consumers reference `@v1`.
 
 ## Status
 
-Under active construction on `dev`. Authentication uses a pre-existing shared GitHub
-Actions OIDC role for this AWS account rather than roles provisioned by this repo — IAM
-role/provider creation is outside the current account permissions. The role's trust
-policy trusts both demo repos' `dev` environment; its permissions policy grants access to
-this project's dedicated artifact bucket. Both policies are managed directly in AWS,
-outside Terraform.
+**Fully validated end-to-end, both consumer apps, all three environments.** Both
+`aws-cicd-demo-python-app` and `aws-cicd-demo-node-app` have real, successful pipeline
+runs for `dev` (push), `stage` (PR merge), and `prod` (PR merge) — each a genuine
+independent build/test/containerize/S3-upload, reviewer-gated on `stage`/`prod`, verified
+by inspecting the actual uploaded S3 objects, not just green checkmarks.
+
+**SDLC model pivoted mid-build.** `promote.yml` (a `workflow_dispatch`-triggered,
+no-rebuild S3-copy promotion step) was built and verified working end-to-end first — a
+real `dev`→`stage` promotion, gated by `stage`'s required reviewer, produced the exact
+same S3 object at the new key. It was then deliberately retired in favor of the
+branch-based SDLC now in use: `stage`/`prod` are real branches, and each demo repo's
+`deploy.yml` caller triggers on PR-merge into them (in addition to push on `dev`),
+independently rebuilding per environment. See `docs/REQUIREMENTS.md` §8 for the full
+reasoning — both models work; this is the one currently in use.
+
+Authentication uses a pre-existing shared GitHub Actions OIDC role for this AWS account
+rather than roles provisioned by this repo — IAM role/provider creation is outside the
+current account permissions. The role's trust policy trusts both demo repos' `dev`,
+`stage`, and `prod` environments; its permissions policy grants access to this project's
+dedicated artifact bucket. Both policies are managed directly in AWS, outside Terraform.
+`AWS_DEPLOY_ROLE_ARN`/`S3_BUCKET` are set as Environment variables on all three
+environments in both consumer repos.
 
 The artifact bucket (`loria-aws-cicd-artifacts-<account-id>`) was created manually in the
 AWS Console rather than via `terraform apply` — no local CLI credentials, and CloudShell's
 VPC networking setup wasn't worth the friction for a one-off bucket. `infra/s3.tf` stays
 as the reference spec for its configuration.
 
-Completed so far: `deploy.yml` (build/test/deploy/notify, both languages, real unit tests
-and hadolint in the `test` job), unchanged since the SDLC pivot below — only the callers
-changed. `AWS_DEPLOY_ROLE_ARN`/`S3_BUCKET` are set as `dev` Environment variables in both
-consumer repos, and as `stage` variables for `python-app`.
+`deploy.yml` itself (build/test/deploy/notify, both languages, real unit tests and
+hadolint in the `test` job) has been unchanged since the SDLC pivot — only the demo repos'
+callers changed to add the `detect-environment` job and new triggers.
 
-**SDLC model pivoted mid-build.** `promote.yml` (a `workflow_dispatch`-triggered,
-no-rebuild S3-copy promotion step) was built and verified working end-to-end — a real
-`dev`→`stage` promotion, gated by `stage`'s required reviewer, produced the exact same S3
-object at the new key. It has since been retired in favor of a branch-based SDLC:
-`stage`/`prod` are now real branches, and each demo repo's `deploy.yml` caller triggers on
-PR-merge into them (in addition to push on `dev`), independently rebuilding per
-environment. See `docs/REQUIREMENTS.md` §8 for the full reasoning.
-
-`aws-cicd-demo-python-app` has a real pipeline run confirmed working for both `dev` (push)
-and `stage` (PR merge) under the new model. `aws-cicd-demo-node-app` hasn't been validated
-under the new triggers yet — its `stage` branch/Environment/trust-policy entry status is
-unconfirmed. `prod` isn't set up for either repo yet.
+Still not built: `rollback.yml`, manifest/task-definition rendering (FR-8/FR-9),
+CloudWatch recording (FR-17/FR-18), and ECR (deferred until the account has that access).
