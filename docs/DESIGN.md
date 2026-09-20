@@ -78,18 +78,32 @@ Jobs, in order:
    (needs: nothing) — both jobs only merge before `deploy`.
 3. **`deploy`** — `needs: [build, test]`. Declares `environment: ${{ inputs.environment }}`
    (see §4). Assumes the shared AWS role via OIDC, `docker build`s the image, `docker
-   run --rm`s it as a smoke test, then `docker save | gzip`s it and uploads the tarball to
-   S3 (see §5 for the key layout and §8 in REQUIREMENTS.md for why S3 instead of ECR).
-4. **`notify`** — `needs: deploy`. Currently an echo placeholder; CloudWatch recording is
-   not yet built (see §7 in REQUIREMENTS.md).
+   run --rm`s it as a smoke test, `docker save | gzip`s it and uploads the tarball to S3
+   (see §5 for the key layout and §8 in REQUIREMENTS.md for why S3 instead of ECR), and
+   outputs a `sha256` digest of the tarball for `render-manifest` to reference — this is
+   the S3-era analog of an ECR image digest, computed since there's no registry assigning
+   one.
+4. **`render-manifest`** — `needs: deploy`. Also declares `environment: ${{ inputs.environment }}`
+   (needed to resolve the same `vars.AWS_DEPLOY_ROLE_ARN`/`S3_BUCKET`, which are
+   environment-scoped — see §4; this may prompt a second approval click on `stage`/`prod`
+   beyond the one `deploy` already required, since GitHub doesn't always treat two jobs
+   referencing the same environment as one gate). Renders a syntactically valid ECS
+   task-def JSON (pure templating, no `ecs:*` calls — FR-8) and uploads it to S3, then
+   assembles and uploads `manifest.json` (FR-9): reads the environment's existing
+   `current.json` (if any) to populate `previousManifestKey`, writes the new manifest to
+   `<git-sha>/manifest.json`, and overwrites `current.json` to point to it.
+5. **`notify`** — `needs: [deploy, render-manifest]`. Echoes success only if both
+   upstream jobs succeeded; CloudWatch recording is not yet built (see §7 in
+   REQUIREMENTS.md), so this remains a placeholder.
 
 Every job that touches AWS begins its own `configure-aws-credentials` step — **jobs do
 not share credentials across job boundaries**; each runs on a fresh runner and must
 authenticate independently. This is a common trip point worth documenting explicitly in
 the framework README.
 
-Not yet built at all: `render-task-definition` and `write-manifest-s3` equivalents (FR-8,
-FR-9). Adding them is a new job between `deploy` and `notify`, not a redesign.
+Not yet built: the `_rollback-history/` maintenance described in §5 (appending each
+manifest to a bounded history list) — that's part of `rollback.yml`'s job (FR-14–16), not
+`render-manifest`'s. `render-manifest` only maintains `current.json`.
 
 `deploy.yml` itself is **environment-agnostic** — it has no idea whether it's being
 invoked for `dev`, `stage`, or `prod`; it just does what `inputs.environment` says. That's
@@ -150,8 +164,8 @@ Planned action names, if/when this gets factored out:
 | `build-node` | `build-command`, `lint-command`, `working-directory` | — | `actions/setup-node`, install, lint. No Docker. |
 | `lint-dockerfile` | `dockerfile-path` | `passed` | Runs `hadolint` against the consumer's Dockerfile. Fails on any error-level finding. |
 | `docker-build-push` | `aws-region`, `docker-context`, `git-sha` | `image-location`, `image-digest` | Multi-stage build; currently uploads to S3 (see REQUIREMENTS.md §8), ECR once available. |
-| `render-task-definition` | `app-name`, `environment`, `image-location`, `container-port`, `cpu`, `memory`, `log-group` | `task-def-json-path` | **Pure templating — no AWS API calls.** Produces a syntactically valid ECS task-def JSON. `executionRoleArn` is a placeholder value, documented as required-before-registration. |
-| `write-manifest-s3` | `s3-bucket`, `app-name`, `environment`, `image-location`, `image-digest`, `task-def-json-path` | `manifest-s3-key` | Assembles manifest (see §5 schema) and uploads. Also appends to rollback history. |
+| `render-task-definition` | `app-name`, `environment`, `image-location`, `container-port`, `cpu`, `memory`, `log-group` | `task-def-json-path` | **Built, inlined in `render-manifest` (§2.1)**, not a separate action. Pure templating — no AWS API calls. `executionRoleArn` is a placeholder value, documented as required-before-registration. |
+| `write-manifest-s3` | `s3-bucket`, `app-name`, `environment`, `image-location`, `image-digest`, `task-def-json-path` | `manifest-s3-key` | **Built, inlined in `render-manifest` (§2.1)**, not a separate action. Assembles manifest (see §5 schema) and uploads; maintains `current.json`. Does not yet append to rollback history — that's `rollback.yml`'s job. |
 | ~~`promote-artifact`~~ | — | — | **Obsolete.** Belonged to the retired artifact-copy promotion model (§2.2); the branch-rebuild SDLC has no promotion step to factor out. |
 | `rollback-from-manifest` | `s3-bucket`, `app-name`, `environment`, `target-sha` (optional) | `restored-manifest-key` | Reads rollback history; re-points "current". |
 | `record-deployment-cloudwatch` | `environment`, `app-name`, `event-type`, `cloudwatch-log-group` | — | Emits a custom metric and/or structured log entry. |
@@ -269,13 +283,13 @@ s3://<bucket>/
       <git-sha>/manifest.json
       <git-sha>/task-def.json
       current.json
-    _rollback-history/
+    _rollback-history/           (not yet built — rollback.yml's job, not render-manifest's)
       dev/   (last N manifests, newest first)
       stage/
       prod/
 ```
 
-### `manifest.json` schema (not yet built — see §2.1)
+### `manifest.json` schema (built — see §2.1)
 
 ```json
 {
@@ -304,10 +318,12 @@ phase, where a `deploy-ecs-service` action would set it `true` and add a
 `registeredArn`/`serviceUpdateId` field. This is the explicit forward-compatibility seam
 called out in REQUIREMENTS.md §7 — no schema migration needed when that phase begins.
 
-`image.uri` above shows the eventual ECR form; currently it would hold the S3 key from
-`deploy.yml`'s image-save step instead (`<app-name>/<environment>/<git-sha>/image.tar.gz`)
-— see REQUIREMENTS.md §8. This whole section is moot until write-manifest-s3 is actually
-built (§2.1), at which point build it against whichever storage is current.
+`image.uri` above shows the eventual ECR form; the actual built manifest holds the S3 key
+instead (`<app-name>/<environment>/<git-sha>/image.tar.gz`) — see REQUIREMENTS.md §8.
+`image.digest` holds a `sha256:` checksum of the saved tarball (computed in `deploy`,
+passed to `render-manifest` as a job output) rather than a registry-assigned digest, since
+there's no registry in this phase — same verification purpose, different source. Swap both
+back to their ECR forms once that access exists; no other schema change needed.
 
 ## 6. IAM design (amended — shared role, not per-environment. See REQUIREMENTS.md §8)
 

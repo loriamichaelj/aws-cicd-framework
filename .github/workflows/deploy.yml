@@ -92,6 +92,8 @@ jobs:
     permissions:
       id-token: write
       contents: read
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
 
@@ -100,21 +102,100 @@ jobs:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ inputs.aws-region }}
 
-      - run: |
+      - id: build
+        run: |
           docker build -t ${{ inputs.app-name }}:${{ github.sha }} .
           docker run --rm ${{ inputs.app-name }}:${{ github.sha }}
           docker save ${{ inputs.app-name }}:${{ github.sha }} | gzip > image.tar.gz
+          echo "digest=sha256:$(sha256sum image.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
           aws s3 cp image.tar.gz s3://${{ vars.S3_BUCKET }}/${{ inputs.app-name }}/${{ inputs.environment }}/${{ github.sha }}/image.tar.gz
 
-  notify:
+  render-manifest:
+    name: Render Manifest
     needs: deploy
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - run: |
+          cat > task-def.json <<EOF
+          {
+            "family": "${{ inputs.app-name }}-${{ inputs.environment }}",
+            "containerDefinitions": [
+              {
+                "name": "${{ inputs.app-name }}",
+                "image": "${{ inputs.app-name }}/${{ inputs.environment }}/${{ github.sha }}/image.tar.gz",
+                "essential": true,
+                "logConfiguration": {
+                  "logDriver": "awslogs",
+                  "options": {
+                    "awslogs-group": "/aws-cicd/${{ inputs.environment }}/${{ inputs.app-name }}",
+                    "awslogs-region": "${{ inputs.aws-region }}",
+                    "awslogs-stream-prefix": "${{ inputs.app-name }}"
+                  }
+                }
+              }
+            ],
+            "requiresCompatibilities": ["FARGATE"],
+            "networkMode": "awsvpc",
+            "cpu": "256",
+            "memory": "512",
+            "executionRoleArn": "PLACEHOLDER-set-before-ecs-registration"
+          }
+          EOF
+          aws s3 cp task-def.json s3://${{ vars.S3_BUCKET }}/${{ inputs.app-name }}/${{ inputs.environment }}/${{ github.sha }}/task-def.json
+
+      - run: |
+          CURRENT_KEY="${{ inputs.app-name }}/${{ inputs.environment }}/current.json"
+          PREVIOUS_MANIFEST_KEY=""
+
+          if aws s3api head-object --bucket ${{ vars.S3_BUCKET }} --key "$CURRENT_KEY" >/dev/null 2>&1; then
+            aws s3 cp "s3://${{ vars.S3_BUCKET }}/$CURRENT_KEY" previous.json
+            PREV_SHA=$(jq -r '.gitSha' previous.json)
+            PREVIOUS_MANIFEST_KEY="${{ inputs.app-name }}/${{ inputs.environment }}/${PREV_SHA}/manifest.json"
+          fi
+
+          cat > manifest.json <<EOF
+          {
+            "appName": "${{ inputs.app-name }}",
+            "environment": "${{ inputs.environment }}",
+            "gitSha": "${{ github.sha }}",
+            "image": {
+              "uri": "${{ inputs.app-name }}/${{ inputs.environment }}/${{ github.sha }}/image.tar.gz",
+              "digest": "${{ needs.deploy.outputs.image-digest }}",
+              "builtByRunId": "${{ github.run_id }}"
+            },
+            "taskDefinition": {
+              "s3Key": "${{ inputs.app-name }}/${{ inputs.environment }}/${{ github.sha }}/task-def.json",
+              "registered": false
+            },
+            "buildTimestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "triggeredBy": "${{ github.actor }}",
+            "workflowRunId": "${{ github.run_id }}",
+            "eventType": "deploy",
+            "previousManifestKey": "$PREVIOUS_MANIFEST_KEY"
+          }
+          EOF
+
+          aws s3 cp manifest.json "s3://${{ vars.S3_BUCKET }}/${{ inputs.app-name }}/${{ inputs.environment }}/${{ github.sha }}/manifest.json"
+          aws s3 cp manifest.json "s3://${{ vars.S3_BUCKET }}/$CURRENT_KEY"
+
+  notify:
+    needs: [deploy, render-manifest]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - if: needs.deploy.result == 'success'
+      - if: needs.deploy.result == 'success' && needs.render-manifest.result == 'success'
         run: |
           echo "deployed ${{ inputs.app-name }} (${{ inputs.language }}) to ${{ inputs.environment }} at ${{ github.sha }}"
 
-      - if: needs.deploy.result != 'success'
+      - if: needs.deploy.result != 'success' || needs.render-manifest.result != 'success'
         run: |
-          echo "deploy FAILED for ${{ inputs.app-name }} (${{ inputs.language }}) to ${{ inputs.environment }} at ${{ github.sha }}, result: ${{ needs.deploy.result }}"
+          echo "deploy FAILED for ${{ inputs.app-name }} (${{ inputs.language }}) to ${{ inputs.environment }} at ${{ github.sha }}, deploy: ${{ needs.deploy.result }}, render-manifest: ${{ needs.render-manifest.result }}"

@@ -93,14 +93,18 @@ follow-on phase.
 
 - FR-8: The framework MUST **render** (template) an ECS-compatible task definition JSON as
   a build output. It MUST NOT call `ecs:RegisterTaskDefinition` or any other ECS API in this
-  phase.
+  phase. **Built** — the `render-manifest` job templates it via shell heredoc, no
+  composite action (see DESIGN.md §3).
 - FR-9: The framework MUST write a **deployment manifest** to S3 for every build, containing
   at minimum: Git SHA, image storage location and digest (ECR URI, or the S3 key
   currently used per FR-5), pointer to the rendered task definition, build timestamp,
   triggering workflow run ID, triggering actor, and a reference to the previous manifest
-  for that environment. *Not yet built — see §8.*
+  for that environment. **Built.** `previousManifestKey` is derived by reading the
+  environment's existing `current.json` (if any) before overwriting it — see DESIGN.md §2.1.
 - FR-10: S3 is the system of record for deployment history and rollback state. It is **not**
-  a deploy target in this phase (no running workload consumes it).
+  a deploy target in this phase (no running workload consumes it). **Partially built** —
+  `current.json` (the "state" pointer) is maintained; `_rollback-history/` (the "history"
+  list) is not yet, since that's `rollback.yml`'s responsibility (FR-14–16), not built yet.
 
 ### 4.4 Environment promotion
 
@@ -199,8 +203,8 @@ traffic, or need to run to be considered complete.
 - A push to `dev` in either demo repo triggers build → test (unit tests + hadolint) →
   containerize → save image to S3 (see FR-5) → render task definition → write manifest to
   S3 → CloudWatch event, with no manual approval required. **Confirmed working** for both
-  `python-app` and `node-app` through the S3-upload step; the render-task-definition,
-  write-manifest, and CloudWatch steps are not yet built — see §8.
+  `python-app` and `node-app` through the write-manifest step; only the CloudWatch step is
+  not yet built — see §8.
 - A pull request merged into `stage` (or `prod`) triggers the `detect-environment` job to
   resolve the correct environment name from `github.event.pull_request.base.ref`, then
   runs the full build → test → containerize → S3-upload pipeline for that environment,
@@ -275,7 +279,19 @@ none change the manifest schema or the eventual ECS seam described in §7.
   "same artifact, never rebuilt" guarantee FR-11 originally specified and that
   `promote.yml` had already proven working. Both models are legitimate; this project now
   uses the rebuild-per-branch one.
+- **Manifest's `image.digest` is a SHA-256 checksum, not a registry digest (FR-9).**
+  Computed via `sha256sum` on the saved tarball in the `deploy` job, passed to
+  `render-manifest` as a job output. Serves the same "prove these are the same bytes"
+  purpose as an ECR-assigned digest, just computed rather than registry-issued. Swap back
+  once ECR access exists.
+- **`render-manifest` declares its own `environment:` (FR-9, FR-13).** Needed to resolve
+  the same environment-scoped `AWS_DEPLOY_ROLE_ARN`/`S3_BUCKET` vars `deploy` already
+  uses. This may cost a second required-reviewer approval click on `stage`/`prod` beyond
+  the one `deploy` already needs, since GitHub doesn't always treat two jobs referencing
+  the same environment in one run as a single gate. Accepted as a minor UX cost rather
+  than threading the ARN through job outputs, which would work around FR-25's intent
+  (values that vary per environment should come from environment-scoped vars, not be
+  passed between jobs as plain strings).
 
-None of this changes what's still deferred per §7 — ECS, `rollback.yml`, CloudWatch
-recording, and manifest/task-definition rendering remain unbuilt, independent of these
-amendments.
+None of this changes what's still deferred per §7 — ECS, `rollback.yml`, and CloudWatch
+recording remain unbuilt, independent of these amendments.
