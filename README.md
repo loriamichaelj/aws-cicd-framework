@@ -10,7 +10,7 @@ Consumer repositories do not copy this pipeline. They call it by reference:
 ```yaml
 jobs:
   deploy:
-    uses: loriamichaelj/aws-cicd-framework/.github/workflows/deploy.yml@dev
+    uses: loriamichaelj/aws-cicd-framework/.github/workflows/deploy.yml@v1
     with:
       app-name: python-app
       language: python
@@ -118,11 +118,14 @@ at the latest compatible release. Consumers reference `@v1`.
 
 ## Status
 
-**Fully validated end-to-end, both consumer apps, all three environments.** Both
-`aws-cicd-demo-python-app` and `aws-cicd-demo-node-app` have real, successful pipeline
-runs for `dev` (push), `stage` (PR merge), and `prod` (PR merge) — each a genuine
-independent build/test/containerize/S3-upload, reviewer-gated on `stage`/`prod`, verified
-by inspecting the actual uploaded S3 objects, not just green checkmarks.
+**v1.0.0 released. Every functional requirement is built and validated with real runs,**
+except what's explicitly deferred (ECS entirely; ECR pending account access). Both
+`aws-cicd-demo-python-app` and `aws-cicd-demo-node-app` reference `@v1` and have real,
+successful pipeline runs across `dev`, `stage`, and `prod` — build, test, hadolint,
+OIDC-authenticated Docker build/run/save, S3 upload, manifest/task-def rendering,
+CloudWatch event recording, and (on `dev` for both apps, `stage` for `python-app`) manual
+rollback — each verified by inspecting the actual AWS API responses (S3 upload
+confirmations, CloudWatch `nextSequenceToken`), not just green checkmarks.
 
 **SDLC model pivoted mid-build.** `promote.yml` (a `workflow_dispatch`-triggered,
 no-rebuild S3-copy promotion step) was built and verified working end-to-end first — a
@@ -137,37 +140,37 @@ Authentication uses a pre-existing shared GitHub Actions OIDC role for this AWS 
 rather than roles provisioned by this repo — IAM role/provider creation is outside the
 current account permissions. The role's trust policy trusts both demo repos' `dev`,
 `stage`, and `prod` environments; its permissions policy grants access to this project's
-dedicated artifact bucket. Both policies are managed directly in AWS, outside Terraform.
-`AWS_DEPLOY_ROLE_ARN`/`S3_BUCKET` are set as Environment variables on all three
-environments in both consumer repos.
+dedicated artifact bucket and CloudWatch log groups. Both policies are managed directly in
+AWS, outside Terraform. `AWS_DEPLOY_ROLE_ARN`/`S3_BUCKET` are set as Environment variables
+on all three environments in both consumer repos.
 
-The artifact bucket (`loria-aws-cicd-artifacts-<account-id>`) was created manually in the
-AWS Console rather than via `terraform apply` — no local CLI credentials, and CloudShell's
-VPC networking setup wasn't worth the friction for a one-off bucket. `infra/s3.tf` stays
-as the reference spec for its configuration.
+The artifact bucket and the three CloudWatch log groups (`infra/s3.tf`,
+`infra/cloudwatch.tf`) were both created manually in the AWS Console rather than via
+`terraform apply` — no local CLI credentials, and CloudShell's VPC networking setup wasn't
+worth the friction for one-off resources this small. Both `.tf` files stay as reference
+specs for their actual configuration.
 
-`deploy.yml` now has a `render-manifest` job (needs `deploy`) that templates an
-ECS-compatible task definition (FR-8, pure JSON templating, no `ecs:*` calls) and writes a
-deployment manifest to S3 (FR-9) — image location, a `sha256` digest of the saved tarball
-standing in for a registry digest, build metadata, and a `previousManifestKey` pointing at
-whatever `current.json` held before this run. Verified working on a real `dev` run.
+`deploy.yml` has a `render-manifest` job that templates an ECS-compatible task definition
+(FR-8, pure JSON templating, no `ecs:*` calls) and writes a deployment manifest to S3
+(FR-9) — image location, a `sha256` digest of the saved tarball standing in for a registry
+digest, build metadata, and a `previousManifestKey` pointing at whatever `current.json`
+held before this run.
 
-`rollback.yml` is also built and **confirmed working end-to-end for both apps**: a
-`workflow_dispatch`-triggered reusable workflow that re-points an environment's
-`current.json` to a prior manifest — either an explicit `target-sha`, or (if omitted)
-whatever `previousManifestKey` the current manifest points to. Deliberately doesn't use a
-separate `_rollback-history/` structure from the original plan; the manifest chain
-`render-manifest` already writes serves the same purpose. Verified against both
-`python-app` and `node-app` on `dev`, each rolling `current.json` back one real deploy,
-confirmed by inspecting the actual S3 download/upload operations.
+`rollback.yml` re-points an environment's `current.json` to a prior manifest — either an
+explicit `target-sha`, or (if omitted) whatever `previousManifestKey` the current manifest
+points to. Deliberately doesn't use a separate `_rollback-history/` structure from the
+original plan; the manifest chain `render-manifest` already writes serves the same
+purpose. Getting it dispatchable surfaced a real GitHub constraint: `workflow_dispatch`
+workflows must exist on a repo's *default branch* to be discoverable/triggerable at all —
+both demo repos' `main` branches now carry `.github/workflows/` (just the two workflow
+files, nothing else) for exactly this reason.
 
-Getting `rollback.yml` dispatchable surfaced one more real constraint: GitHub requires a
-`workflow_dispatch` workflow's file to exist on a repo's *default branch* to be
-discoverable/triggerable at all — even when you then run a different branch's version of
-it via the branch selector. Both demo repos' `main` branches now carry
-`.github/workflows/` (just the workflow files, nothing else — no Dockerfile, source, or
-tests) for exactly this reason.
+`notify` (in both `deploy.yml` and `rollback.yml`) writes a structured JSON event —
+`eventType`, `appName`, `environment`, `result`, `workflowRunId`, `triggeredBy`, plus
+`gitSha` or `targetSha` — to that environment's CloudWatch log group
+(`/aws-cicd/<environment>`), fulfilling FR-17/FR-18.
 
-Still not built: CloudWatch recording (FR-17/FR-18), and ECR (deferred until the account
-has that access). That's everything from the original build order of operations except
-CloudWatch.
+`v1.0.0` is tagged from `prod` (fast-forwarded from `dev` — the framework's entire build,
+promoted in one shot since `stage`/`prod` had never moved before), with a floating `v1`
+tag at the same commit. Both demo repos switched their `deploy.yml`/`rollback.yml`
+references from `@dev` to `@v1`, confirmed working with real runs on every branch.
