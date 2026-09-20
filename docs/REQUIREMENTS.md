@@ -245,8 +245,12 @@ none change the manifest schema or the eventual ECS seam described in §7.
   role now serves all three environments.
 - **No Terraform for IAM/OIDC (§10 as originally written).** `infra/iam-roles.tf` and
   `infra/oidc-provider.tf` were removed; the shared role's trust and permissions policies
-  are managed directly in AWS, outside this repo. `infra/s3.tf` (the artifact bucket) is
-  the only AWS resource this repo currently provisions.
+  are managed directly in AWS, outside this repo.
+- **The S3 bucket was created manually, not via `terraform apply` (§10).** No local AWS
+  CLI credentials, and CloudShell's networking setup added enough friction that a one-off
+  manual creation in the console was the pragmatic call. `infra/s3.tf` stays as the
+  reference spec for the bucket's intended configuration (versioning, encryption,
+  public-access-block) — see DESIGN.md §10.
 
 None of this changes what's still deferred per §7 — ECS, `promote.yml`, `rollback.yml`,
 CloudWatch recording, and manifest/task-definition rendering remain unbuilt, independent

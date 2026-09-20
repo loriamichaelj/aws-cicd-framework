@@ -424,10 +424,17 @@ not built.
 
 This account's IAM permissions turned out not to include `iam:CreateRole` or
 `iam:CreateOpenIDConnectProvider` (a shared role/provider already existed for other
-projects), and no ECR access. What this repo actually provisions:
+projects), and no ECR access.
 
-- One S3 bucket (`loria-aws-cicd-artifacts-<account-id>`), for saved image tarballs and
-  eventually deployment manifests — versioned, encrypted, public access fully blocked.
+`infra/s3.tf` documents the artifact bucket's intended configuration
+(`loria-aws-cicd-artifacts-<account-id>`, versioned, SSE-S3 encrypted, public access
+fully blocked) but **the bucket itself was created manually via the AWS Console**, not by
+running `terraform apply` — this account has no local CLI credentials, and getting a
+CloudShell session usable for Terraform (private-VPC networking, no direct SSH access)
+added enough friction that a one-off manual bucket creation was the pragmatic call. The
+`.tf` file stays as the reference spec for what was actually configured, and as a
+starting point if this ever gets reconciled with real Terraform state later (via
+`terraform import`).
 
 Not provisioned by this repo, and not planned to be unless account permissions change:
 
@@ -437,6 +444,6 @@ Not provisioned by this repo, and not planned to be unless account permissions c
 - CloudWatch log groups — not yet needed, since CloudWatch recording (FR-17/FR-18) isn't
   built.
 
-Applied once via `terraform apply` as a bootstrap step, not part of any GitHub Actions run
-(no pipeline job manages its own infra — that would be a privilege-escalation smell worth
-avoiding even in a demo).
+If Terraform-managed provisioning is revisited later (no pipeline job should ever manage
+its own infra — that would be a privilege-escalation smell worth avoiding even in a demo),
+it would be applied once as a bootstrap step, not as part of any GitHub Actions run.
