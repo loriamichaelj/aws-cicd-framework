@@ -11,22 +11,23 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│ aws-cicd-framework (public repo)                                    │
+│ aws-cicd-framework (public repo) — v1.0.0 / v1                      │
 │                                                                     │
 │  .github/workflows/                                                 │
-│    deploy.yml                  build/test/deploy/notify jobs,       │
-│                                 inlined steps (no composite actions  │
-│                                 yet — see §3). Environment-agnostic  │
-│                                 — the caller decides which env.      │
+│    deploy.yml                  build/test/deploy/render-manifest/   │
+│                                 notify, inlined steps (no composite  │
+│                                 actions yet — see §3). Environment-  │
+│                                 agnostic — the caller decides which  │
+│                                 env.                                 │
 │    rollback.yml                built — re-points current.json via   │
 │                                 the existing manifest chain          │
 │                                                                     │
 │  infra/ (Terraform)                                                 │
-│    s3.tf                       artifact bucket — the only AWS       │
-│    variables.tf, outputs.tf    resource this repo currently         │
-│    versions.tf                 provisions (see §10)                 │
+│    s3.tf, cloudwatch.tf        artifact bucket + log groups —       │
+│    variables.tf, outputs.tf    reference specs; actual creation     │
+│    versions.tf                 was manual (see §10)                 │
 └─────────────────────────────────────────────────────────────────────┘
-                 ▲ uses: aws-cicd-framework/.github/workflows/deploy.yml@dev
+                 ▲ uses: aws-cicd-framework/.github/workflows/deploy.yml@v1
                  │
          ┌───────┴────────┐
          │                  │
@@ -93,9 +94,15 @@ Jobs, in order:
    assembles and uploads `manifest.json` (FR-9): reads the environment's existing
    `current.json` (if any) to populate `previousManifestKey`, writes the new manifest to
    `<git-sha>/manifest.json`, and overwrites `current.json` to point to it.
-5. **`notify`** — `needs: [deploy, render-manifest]`. Echoes success only if both
-   upstream jobs succeeded; CloudWatch recording is not yet built (see §7 in
-   REQUIREMENTS.md), so this remains a placeholder.
+5. **`notify`** — `needs: [deploy, render-manifest]`. Also declares
+   `environment: ${{ inputs.environment }}` (same reason and trade-off as `render-manifest`
+   above — a third approval-click possibility on `stage`/`prod`). Assumes the shared role,
+   then writes a structured JSON event (`eventType: "deploy"`, `appName`, `environment`,
+   `gitSha`, `result`, `workflowRunId`, `triggeredBy`) to that environment's CloudWatch log
+   group (`/aws-cicd/<environment>`, log stream named after the app) via `aws logs
+   put-log-events` — FR-17/18, built and confirmed working (verified via the AWS API's own
+   `nextSequenceToken` response). `logs:CreateLogStream` is attempted unconditionally with
+   `|| true` to swallow the harmless "already exists" error on repeat runs.
 
 Every job that touches AWS begins its own `configure-aws-credentials` step — **jobs do
 not share credentials across job boundaries**; each runs on a fresh runner and must
@@ -155,17 +162,21 @@ service exists to health-check in this phase). Jobs:
    manifest is confirmed to exist (`s3api head-object`), its content is copied over
    `current.json` — the actual "re-point current to a prior manifest" FR-15 describes,
    just via the existing linked-list-of-manifests instead of a separate history structure.
-2. **`notify`** — `if: always()`, echoes success or failure based on `needs.rollback.result`.
+2. **`notify`** — `if: always()`. Same CloudWatch write as `deploy.yml`'s `notify` (§2.1),
+   with `eventType: "rollback"` and `targetSha` in place of `gitSha` — same log
+   group/stream, genuinely indistinguishable in shape from a forward deploy event except
+   for those two fields, matching FR-16's intent directly.
 
 The consumer's caller is a `workflow_dispatch`-triggered thin caller, same shape as
 `promote.yml`'s was before retirement: `environment` as a dropdown (`dev`/`stage`/`prod`)
 and `target-sha` as optional free text.
 
-Verified with real dispatches against both `python-app` and `node-app` on `dev`: each
-correctly downloaded `current.json`, followed its `previousManifestKey` to the prior
-deploy's manifest, and overwrote `current.json` with it — confirmed via the actual S3
-download/upload log lines, not just a green checkmark. `stage`/`prod` rollback untested
-(same mechanism, different environment name).
+Verified with real dispatches: both `python-app` and `node-app` on `dev` (following
+`previousManifestKey`), and `python-app` on `stage` (explicit `target-sha`, after
+discovering the runs API's `head_sha` field can't be trusted for `pull_request`-triggered
+runs — see REQUIREMENTS.md §8). All confirmed via the actual S3 download/upload log lines
+and the CloudWatch write's `nextSequenceToken` response, not just green checkmarks. `prod`
+rollback specifically untested (identical code path to `stage`).
 
 **Getting this dispatchable surfaced a platform constraint, not a bug:** GitHub requires a
 `workflow_dispatch` workflow's file to exist on a repo's *default branch* to be
@@ -454,15 +465,25 @@ action — see §3) against the consumer repo's root `Dockerfile`. Configuration
   in REQUIREMENTS.md §4.2.1 is enforced consistently rather than left to each consumer's
   interpretation.
 
-## 8. Versioning
+## 8. Versioning (built)
 
-- SemVer tags on `aws-cicd-framework` (`v1.0.0`, `v1.1.0`, ...).
+- SemVer tags on `aws-cicd-framework` (`v1.0.0`, `v1.1.0`, ...). `v1.0.0` is cut, from
+  `prod` (fast-forwarded from `dev` — 17 commits, the framework's entire build to that
+  point, since `stage`/`prod` had never been promoted before).
 - A floating `v1` tag, re-pointed at the latest compatible release after validation.
+  Created pointing at the same commit as `v1.0.0`.
 - Consumers reference `@v1` by default; pin to an exact tag (`@v1.2.0`) only if isolating
-  from an upcoming change.
+  from an upcoming change. Both demo repos' `deploy.yml`/`rollback.yml` callers reference
+  `@v1` (switched from `@dev`) across all four branches (`dev`/`stage`/`prod`/`main`),
+  confirmed working with real successful runs on every environment for both apps.
 - Breaking changes (input renames, removed outputs, changed manifest schema fields) require
   a major version bump and a new floating tag (`v2`) — existing consumers on `@v1`
   are unaffected until they deliberately move.
+
+**Practical implication of switching to `@v1`:** the demo repos no longer track the
+framework's `dev` HEAD live. A future framework change on `dev` doesn't reach them until
+it's promoted through `stage`/`prod` and a new tag (`v1.1.0`, etc.) moves the `v1` pointer
+forward — the exact discipline this whole project exists to demonstrate.
 
 ## 9. Repository layout reference
 
@@ -472,11 +493,13 @@ action — see §3) against the consumer repo's root `Dockerfile`. Configuration
 aws-cicd-framework/
 ├── .github/
 │   └── workflows/
-│       ├── deploy.yml              # built — build/test/deploy/notify, both languages,
-│       │                           # environment-agnostic (§2.1)
+│       ├── deploy.yml              # built — build/test/deploy/render-manifest/notify,
+│       │                           # both languages, environment-agnostic (§2.1)
 │       └── rollback.yml            # built — re-points current.json via manifest chain
-├── infra/                          # Terraform — only what this account permits (§10)
+├── infra/                          # Terraform reference specs — actual creation was
+│   │                                # manual for both s3.tf and cloudwatch.tf (§10)
 │   ├── s3.tf
+│   ├── cloudwatch.tf
 │   ├── variables.tf
 │   ├── outputs.tf
 │   └── versions.tf
@@ -525,13 +548,16 @@ added enough friction that a one-off manual bucket creation was the pragmatic ca
 starting point if this ever gets reconciled with real Terraform state later (via
 `terraform import`).
 
+`infra/cloudwatch.tf` documents the three log groups (`/aws-cicd/dev`, `/aws-cicd/stage`,
+`/aws-cicd/prod`, 30-day retention) the same way — **created manually via the AWS
+Console**, same reasoning as the S3 bucket. The `.tf` file is the reference spec, not what
+was actually applied.
+
 Not provisioned by this repo, and not planned to be unless account permissions change:
 
 - The GitHub OIDC provider and the shared IAM role — pre-existing, managed directly in
   AWS by whoever administers this account.
 - ECR repositories — no access to create them in this account currently.
-- CloudWatch log groups — not yet needed, since CloudWatch recording (FR-17/FR-18) isn't
-  built.
 
 If Terraform-managed provisioning is revisited later (no pipeline job should ever manage
 its own infra — that would be a privilege-escalation smell worth avoiding even in a demo),

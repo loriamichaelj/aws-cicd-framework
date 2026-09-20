@@ -129,18 +129,28 @@ follow-on phase.
   target environment's "current" manifest to it. **Built** — "S3 rollback history" is the
   manifest chain (`previousManifestKey`) rather than a separate history structure; see §8.
 - FR-16: Rollback MUST be recorded as an event in the deployment audit trail (CloudWatch and
-  S3 history), indistinguishable in traceability from a forward deployment. **Partially
-  built** — the S3 side is satisfied by `current.json`'s versioning (the bucket has S3
-  versioning enabled, so every overwrite is already recoverable); the CloudWatch side
-  isn't built yet (FR-17/18).
+  S3 history), indistinguishable in traceability from a forward deployment. **Built.** The
+  S3 side is satisfied by `current.json`'s versioning (S3 versioning is enabled on the
+  bucket, so every overwrite is already recoverable); the CloudWatch side writes a
+  structured JSON event with `eventType: "rollback"` to the same log group/stream a
+  forward deploy uses — genuinely indistinguishable in shape, only the `eventType` field
+  (and `targetSha` vs. `gitSha`) differs.
 
 ### 4.6 Observability
 
 - FR-17: Every deploy and rollback event MUST emit a CloudWatch record (custom metric
-  and/or log entry) tagged with environment, application name, and event type. *"Promote"
-  is no longer a distinct event type — see §8; a deploy triggered by a `stage`/`prod`
-  PR-merge is still just a `deploy` event, distinguished by its `environment` tag.*
-- FR-18: CloudWatch log groups MUST be scoped per environment.
+  and/or log entry) tagged with environment, application name, and event type. **Built and
+  confirmed working** for both apps — a structured JSON log entry (`eventType`, `appName`,
+  `environment`, `result`, `workflowRunId`, `triggeredBy`, plus `gitSha` or `targetSha`) is
+  written via `aws logs put-log-events` from `notify` in both `deploy.yml` and
+  `rollback.yml`. "Promote" is no longer a distinct event type — see §8; a deploy
+  triggered by a `stage`/`prod` PR-merge is still just a `deploy` event, distinguished by
+  its `environment` tag.
+- FR-18: CloudWatch log groups MUST be scoped per environment. **Built** — one log group
+  per environment (`/aws-cicd/dev`, `/aws-cicd/stage`, `/aws-cicd/prod`), each app writing
+  to its own log *stream* within that group. Deliberately per-environment, not per-app —
+  distinct from the per-app log group already referenced in the task-definition template
+  (`/aws-cicd/<environment>/<app-name>`, reserved for future ECS container runtime logs).
 
 ### 4.7 Identity and access
 
@@ -177,6 +187,9 @@ follow-on phase.
   repositories.
 - FR-27: The framework MUST be versioned using SemVer tags, with a floating major-version
   tag (e.g. `v1`) maintained to point at the latest compatible patch/minor release.
+  **Built.** `v1.0.0` cut from `prod`, floating `v1` tag pointing at the same commit. Both
+  demo repos' `deploy.yml`/`rollback.yml` callers reference `@v1` (switched from `@dev`),
+  confirmed working with real successful runs on `dev`, `stage`, and `prod` for both apps.
 
 ## 5. Repositories
 
@@ -206,9 +219,9 @@ traffic, or need to run to be considered complete.
 
 - A push to `dev` in either demo repo triggers build → test (unit tests + hadolint) →
   containerize → save image to S3 (see FR-5) → render task definition → write manifest to
-  S3 → CloudWatch event, with no manual approval required. **Confirmed working** for both
-  `python-app` and `node-app` through the write-manifest step; only the CloudWatch step is
-  not yet built — see §8.
+  S3 → CloudWatch event, with no manual approval required. **Confirmed working end to end**
+  for both `python-app` and `node-app`, including the CloudWatch event (verified via the
+  AWS API's own `nextSequenceToken` response, not just a green checkmark).
 - A pull request merged into `stage` (or `prod`) triggers the `detect-environment` job to
   resolve the correct environment name from `github.event.pull_request.base.ref`, then
   runs the full build → test → containerize → S3-upload pipeline for that environment,
@@ -218,10 +231,10 @@ traffic, or need to run to be considered complete.
   each environment's own prefix.
 - A manually dispatched rollback on any environment restores a prior manifest and is
   recorded as a distinct, auditable event. **Confirmed working** for both `python-app` and
-  `node-app` on `dev` — each real dispatch correctly followed `previousManifestKey` back
-  one deploy and re-pointed `current.json`, verified against the actual S3 operations.
-  `stage`/`prod` rollback untested (mechanism is identical, just a different environment
-  name — no reason to expect different behavior, but not yet exercised).
+  `node-app` on `dev` (following `previousManifestKey`) and for `python-app` on `stage`
+  (explicit `target-sha`) — each verified against the actual S3 operations and the
+  CloudWatch write's `nextSequenceToken` response. `prod` rollback specifically untested
+  (identical code path to `stage`; low marginal risk).
 - Attempting to assume the `prod` OIDC role from a workflow run not executing under the
   `prod` GitHub Environment fails.
 - Attempting to write to another environment's S3 prefix using a given environment's role
@@ -317,6 +330,22 @@ none change the manifest schema or the eventual ECS seam described in §7.
   Dockerfile, source, or tests there); it now holds the README plus just the two workflow
   files, which is inert on `main` itself (`deploy.yml`'s triggers don't watch `main`, and
   `rollback.yml` only runs on explicit dispatch).
+- **CloudWatch log groups are per-environment, not per-app (FR-17, FR-18).** `notify` in
+  both `deploy.yml` and `rollback.yml` assumes the shared role a second time (same
+  approval-click trade-off as `render-manifest`, see above) and writes one JSON log entry
+  per run via `aws logs put-log-events`, to a stream named after the app inside that
+  environment's log group. `logs:CreateLogStream` is attempted unconditionally with
+  `|| true` to swallow the harmless "already exists" error on every run after the first,
+  rather than checking existence first — one fewer API call, same result.
+- **The GitHub Actions runs API's `head_sha` field is unreliable for `pull_request`-
+  triggered runs.** Discovered testing `stage` rollback: `gh api .../runs/{id} --jq
+  .head_sha` returned a different SHA than the one `deploy.yml` actually used internally
+  for its S3 keys (`github.sha` inside a `pull_request`-triggered run reflects a synthetic
+  merge context, not necessarily what the API's `head_sha` field reports). Not a bug in
+  this framework — a GitHub platform quirk worth remembering when debugging or scripting
+  against run metadata: pull the real deployed SHA from the job's own log output (e.g. the
+  S3 upload path), not the runs API.
 
-None of this changes what's still deferred per §7 — ECS and CloudWatch recording remain
-unbuilt, independent of these amendments.
+None of this changes what's still deferred per §7 — only ECS remains unbuilt (ECR is
+deferred pending account access, tracked separately from §7). Every other functional
+requirement in §4 is now built and validated with real runs, not just written.
