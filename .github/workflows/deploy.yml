@@ -1,5 +1,7 @@
 name: Deploy
 
+# Reusable workflow: consuming repos (node-app, python-app, ...) call this
+# via `uses: loriamichaelj/aws-cicd-framework/.github/workflows/deploy.yml@v1`
 on:
   workflow_call:
     inputs:
@@ -8,14 +10,16 @@ on:
         required: true
       language:
         type: string
-        required: true
+        required: true # "python" or "node" - controls which build/test steps run
       environment:
         type: string
-        required: true
+        required: true # dev | stage | prod - selects the GitHub environment/secrets
       aws-region:
         type: string
         required: true
 
+# Default token permissions for the workflow; jobs that need AWS OIDC
+# federation elevate to id-token: write individually.
 permissions:
   contents: read
 
@@ -26,6 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Python branch: install deps and byte-compile to catch syntax errors early
       - if: inputs.language == 'python'
         uses: actions/setup-python@v5
         with:
@@ -36,6 +41,7 @@ jobs:
           pip install -r requirements.txt
           python -m compileall -q src
 
+      # Node branch: install deps and lint
       - if: inputs.language == 'node'
         uses: actions/setup-node@v4
         with:
@@ -52,6 +58,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Python branch: run the pytest suite
       - if: inputs.language == 'python'
         uses: actions/setup-python@v5
         with:
@@ -63,6 +70,7 @@ jobs:
           pip install pytest
           pytest -q
 
+      # Node branch: run the npm test suite
       - if: inputs.language == 'node'
         uses: actions/setup-node@v4
         with:
@@ -73,6 +81,8 @@ jobs:
           npm ci
           npm test
 
+      # Pull this framework repo's own Dockerfile lint config (shared across
+      # all consuming apps) so every app lints against the same rules.
       - uses: actions/checkout@v4
         with:
           repository: loriamichaelj/aws-cicd-framework
@@ -88,20 +98,25 @@ jobs:
     name: Deploy
     needs: [build, test]
     runs-on: ubuntu-latest
-    environment: ${{ inputs.environment }}
+    environment: ${{ inputs.environment }} # gates on environment protection rules/secrets
     permissions:
-      id-token: write
+      id-token: write # required for OIDC federation to the AWS deploy role
       contents: read
     outputs:
       image-digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
 
+      # Assume the per-environment AWS deploy role via OIDC (no static keys)
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ inputs.aws-region }}
 
+      # Build the image, smoke-test it locally, then ship it to S3 as a
+      # gzipped tarball keyed by app/environment/commit sha. The sha256 of
+      # that tarball is recorded as this job's "image-digest" output for the
+      # manifest step below.
       - id: build
         run: |
           docker build -t ${{ inputs.app-name }}:${{ github.sha }} .
@@ -124,6 +139,9 @@ jobs:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ inputs.aws-region }}
 
+      # Render an ECS task definition skeleton for this build and stash it in
+      # S3 alongside the image. executionRoleArn is left as a placeholder -
+      # it's filled in at actual ECS registration time, not here.
       - run: |
           cat > task-def.json <<EOF
           {
@@ -152,6 +170,9 @@ jobs:
           EOF
           aws s3 cp task-def.json s3://${{ vars.S3_BUCKET }}/${{ inputs.app-name }}/${{ inputs.environment }}/${{ github.sha }}/task-def.json
 
+      # Build the deploy manifest that ties image + task-def + git metadata
+      # together, and chain it to whatever manifest was "current" before this
+      # run so rollback.yml can walk back one step without extra input.
       - run: |
           CURRENT_KEY="${{ inputs.app-name }}/${{ inputs.environment }}/current.json"
           PREVIOUS_MANIFEST_KEY=""
@@ -184,12 +205,14 @@ jobs:
           }
           EOF
 
+          # Write the versioned manifest, then overwrite "current.json" (the
+          # pointer rollback.yml reads) to point at this deploy.
           aws s3 cp manifest.json "s3://${{ vars.S3_BUCKET }}/${{ inputs.app-name }}/${{ inputs.environment }}/${{ github.sha }}/manifest.json"
           aws s3 cp manifest.json "s3://${{ vars.S3_BUCKET }}/$CURRENT_KEY"
 
   notify:
     needs: [deploy, render-manifest]
-    if: always()
+    if: always() # run even if deploy/render-manifest failed, so failures get logged too
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
     permissions:
@@ -201,6 +224,8 @@ jobs:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ inputs.aws-region }}
 
+      # Emit a single structured event to CloudWatch Logs recording the
+      # outcome of this deploy (success/failure), for audit/alerting.
       - run: |
           RESULT="success"
           if [ "${{ needs.deploy.result }}" != "success" ] || [ "${{ needs.render-manifest.result }}" != "success" ]; then

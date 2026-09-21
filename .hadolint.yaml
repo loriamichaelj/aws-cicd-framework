@@ -1,9 +1,24 @@
+# Shared hadolint (Dockerfile linter) config, pulled by deploy.yml's test job
+# in every consuming app repo so all Dockerfiles are held to the same rules.
+
+# Any finding at "style" severity or above fails the lint step.
 failure-threshold: style
 
+# Registries allowed in FROM instructions - Docker Hub plus this org's ECR
+# repos (wildcarded across accounts/regions).
 trustedRegistries:
   - docker.io
   - "*.dkr.ecr.*.amazonaws.com"
 
+# Rules downgraded/upgraded to "error" regardless of hadolint's own default
+# severity, so these specific checks always fail the build:
+#   DL3002 - last user in Dockerfile should not be root
+#   DL3007 - avoid using the ":latest" tag
+#   DL3008 - pin versions in apt-get install
+#   DL3013 - pin versions in pip install
+#   DL3016 - pin versions in npm install
+#   DL3028 - pin versions in gem install
+#   DL3042 - avoid use of cache directory with pip install (use --no-cache-dir)
 override:
   error:
     - DL3002
